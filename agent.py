@@ -8,7 +8,7 @@ import requests
 import websocket
 
 
-CONTROL_PLANE_URL = "http://192.168.1.14:3000"
+CONTROL_PLANE_URL = "http://192.168.1.3:3000"
 VLLM_CHAT_COMPLETIONS_URL = "http://localhost:8000/v1/chat/completions"
 
 MACHINE_ID = "4b660795-20c8-4daf-bdde-6e06d293594d"
