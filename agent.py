@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urlparse
@@ -8,11 +10,51 @@ import requests
 import websocket
 
 
-CONTROL_PLANE_URL = "http://192.168.1.3:3000"
+DEFAULT_CONTROL_PLANE_URL = "http://192.168.1.3:3000"
 VLLM_CHAT_COMPLETIONS_URL = "http://localhost:8000/v1/chat/completions"
+CREDENTIALS_PATH = os.environ.get(
+    "AI_NODE_CREDENTIALS_PATH",
+    "/opt/ai-node/credentials.json"
+)
 
-MACHINE_ID = "4b660795-20c8-4daf-bdde-6e06d293594d"
-AGENT_TOKEN = "65404611-68bb-4bb7-bf84-1a5d4b32f081"
+
+def load_credentials(path: str = CREDENTIALS_PATH) -> dict:
+    if not os.path.isfile(path):
+        print(
+            f"Missing credentials file: {path}\n"
+            "Re-run the installer with an enrollment key so permanent "
+            "machine credentials are written before starting the agent."
+        )
+        sys.exit(1)
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Failed to read credentials from {path}: {error}")
+        sys.exit(1)
+
+    machine_id = data.get("machine_id")
+    agent_token = data.get("agent_token")
+
+    if not machine_id or not agent_token:
+        print(
+            f"Credentials file {path} must include machine_id and agent_token"
+        )
+        sys.exit(1)
+
+    return data
+
+
+credentials = load_credentials()
+
+CONTROL_PLANE_URL = (
+    os.environ.get("CONTROL_PLANE_URL")
+    or credentials.get("control_plane_url")
+    or DEFAULT_CONTROL_PLANE_URL
+)
+MACHINE_ID = credentials["machine_id"]
+AGENT_TOKEN = credentials["agent_token"]
 
 websocket_send_lock = threading.Lock()
 
