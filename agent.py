@@ -6,6 +6,7 @@ import threading
 import time
 from urllib.parse import urlparse
 
+import psutil
 import requests
 import websocket
 
@@ -82,24 +83,109 @@ def get_gpu_stats():
         name = parts[0]
         temperature = float(parts[1])
         utilization = float(parts[2])
-        memory_used = int(parts[3])
-        memory_total = int(parts[4])
-        power_draw = float(parts[5])
+        memory_used = int(float(parts[3]))
+        memory_total = int(float(parts[4]))
+        power_draw = float(parts[5]) if parts[5] not in ("", "[N/A]") else None
 
-        gpus.append({
+        gpu = {
             "name": name,
             "temperature": temperature,
             "utilization": utilization,
             "memory_used": memory_used,
             "memory_total": memory_total,
-            "power_draw": power_draw
-        })
+        }
+        if power_draw is not None:
+            gpu["power_draw"] = power_draw
+
+        gpus.append(gpu)
 
     return gpus
 
 
+def get_cpu_temperature():
+    try:
+        temps = psutil.sensors_temperatures(fahrenheit=False)
+    except (AttributeError, OSError):
+        return None
+
+    if not temps:
+        return None
+
+    preferred_keys = ("coretemp", "k10temp", "cpu_thermal", "acpitz")
+    for key in preferred_keys:
+        entries = temps.get(key)
+        if entries:
+            values = [entry.current for entry in entries if entry.current is not None]
+            if values:
+                return round(sum(values) / len(values), 1)
+
+    for entries in temps.values():
+        values = [entry.current for entry in entries if entry.current is not None]
+        if values:
+            return round(sum(values) / len(values), 1)
+
+    return None
+
+
+def get_cpu_stats():
+    return {
+        "utilization": round(psutil.cpu_percent(interval=0.2), 1),
+        "temperature": get_cpu_temperature(),
+        "cores": psutil.cpu_count(logical=True),
+    }
+
+
+def get_memory_stats():
+    memory = psutil.virtual_memory()
+    return {
+        "used": int(memory.used),
+        "total": int(memory.total),
+        "percent": round(memory.percent, 1),
+    }
+
+
+def get_storage_stats():
+    storage = []
+    seen_devices = set()
+
+    for partition in psutil.disk_partitions(all=False):
+        if partition.fstype in ("", "tmpfs", "devtmpfs", "squashfs", "overlay"):
+            continue
+        if not partition.mountpoint:
+            continue
+        if partition.device in seen_devices:
+            continue
+
+        try:
+            usage = psutil.disk_usage(partition.mountpoint)
+        except (PermissionError, OSError):
+            continue
+
+        seen_devices.add(partition.device)
+        storage.append({
+            "mount": partition.mountpoint,
+            "device": partition.device,
+            "used": int(usage.used),
+            "total": int(usage.total),
+            "free": int(usage.free),
+            "percent": round(usage.percent, 1),
+        })
+
+    storage.sort(key=lambda item: (item["mount"] != "/", item["mount"]))
+    return storage
+
+
+def collect_telemetry():
+    return {
+        "gpus": get_gpu_stats(),
+        "cpu": get_cpu_stats(),
+        "memory": get_memory_stats(),
+        "storage": get_storage_stats(),
+    }
+
+
 def send_heartbeat():
-    gpus = get_gpu_stats()
+    telemetry = collect_telemetry()
 
     response = requests.post(
         f"{CONTROL_PLANE_URL}/machines/heartbeat",
@@ -109,7 +195,10 @@ def send_heartbeat():
         },
         json={
             "machine_id": MACHINE_ID,
-            "gpus": gpus
+            "gpus": telemetry["gpus"],
+            "cpu": telemetry["cpu"],
+            "memory": telemetry["memory"],
+            "storage": telemetry["storage"],
         },
         timeout=5
     )
@@ -117,7 +206,12 @@ def send_heartbeat():
     response.raise_for_status()
 
     print("Heartbeat:", response.json())
-    print("GPU:", gpus)
+    print("Telemetry:", {
+        "gpus": telemetry["gpus"],
+        "cpu": telemetry["cpu"],
+        "memory": telemetry["memory"],
+        "storage": telemetry["storage"],
+    })
 
 def poll_commands():
     try:
