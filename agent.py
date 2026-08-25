@@ -336,6 +336,70 @@ def run_subprocess(command, timeout=None):
     return result
 
 
+def docker_pull_with_progress(command_id, container_image, timeout=3600):
+    """Pull image while streaming layer progress to control plane."""
+    command = ["docker", "pull", container_image]
+    print("Running:", " ".join(command))
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    last_report = 0.0
+    last_line = ""
+    deadline = time.time() + timeout
+
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            print(line)
+            last_line = line
+
+            now = time.time()
+            if now - last_report >= 5 or "Pull complete" in line or "Status:" in line:
+                # Map pull sub-steps into 25–65% of overall install progress.
+                percent = 25
+                lower = line.lower()
+                if "downloading" in lower:
+                    percent = 35
+                elif "extracting" in lower:
+                    percent = 50
+                elif "pull complete" in lower or "digest:" in lower:
+                    percent = 60
+
+                report_progress(
+                    command_id,
+                    "pull_image",
+                    line[:500],
+                    percent=percent,
+                    log_line=line[:500]
+                )
+                last_report = now
+
+            if now > deadline:
+                process.kill()
+                raise TimeoutError(
+                    f"docker pull timed out after {timeout}s: {container_image}"
+                )
+
+        return_code = process.wait(timeout=30)
+    except Exception:
+        process.kill()
+        raise
+
+    if return_code != 0:
+        raise RuntimeError(
+            f"docker pull failed ({return_code}): {container_image}\n{last_line}"
+        )
+
+
 def docker_available():
     run_subprocess(["docker", "info"], timeout=30)
 
@@ -355,11 +419,11 @@ def handle_install_llm(command_id, payload):
     report_progress(
         command_id,
         "pull_image",
-        f"Pulling {container_image}",
+        f"Pulling {container_image} (this can take 20–40 min on first run)",
         percent=25,
         log_line=f"docker pull {container_image}"
     )
-    run_subprocess(["docker", "pull", container_image], timeout=3600)
+    docker_pull_with_progress(command_id, container_image, timeout=3600)
 
     # Remove any leftover container with the same name.
     subprocess.run(
@@ -395,6 +459,7 @@ def handle_install_llm(command_id, payload):
     )
     deadline = time.time() + 300
     last_error = None
+    last_health_report = 0.0
     while time.time() < deadline:
         try:
             response = requests.get(
@@ -422,6 +487,16 @@ def handle_install_llm(command_id, payload):
             last_error = f"HTTP {response.status_code}"
         except Exception as error:
             last_error = str(error)
+
+        now = time.time()
+        if now - last_health_report >= 10:
+            report_progress(
+                command_id,
+                "health_check",
+                f"Waiting for model server… ({last_error or 'starting'})",
+                percent=90
+            )
+            last_health_report = now
         time.sleep(5)
 
     raise TimeoutError(
