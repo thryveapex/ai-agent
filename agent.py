@@ -58,6 +58,8 @@ MACHINE_ID = credentials["machine_id"]
 AGENT_TOKEN = credentials["agent_token"]
 
 websocket_send_lock = threading.Lock()
+active_command_lock = threading.Lock()
+active_command_id = None
 
 
 def get_gpu_stats():
@@ -214,6 +216,12 @@ def send_heartbeat():
     })
 
 def poll_commands():
+    global active_command_id
+
+    with active_command_lock:
+        if active_command_id is not None:
+            return
+
     try:
         response = requests.get(
             f"{CONTROL_PLANE_URL}/machines/{MACHINE_ID}/commands/next",
@@ -231,57 +239,317 @@ def poll_commands():
         if not command:
             return
 
-        print(f"Received command: {command['type']}")
+        command_type = command.get("type")
+        command_id = command.get("commandId")
+        print(f"Received command: {command_type}")
 
-        if command["type"] == "PING":
-            result = "PONG"
+        if command_type == "PING":
+            complete_command(command_id, "COMPLETED", "PONG")
+            return
 
-            print(f"Command result: {result}")
-
-            complete_command(
-                command["commandId"],
-                "COMPLETED",
-                result
-            )
-
-        if command["type"] == "INFERENCE":
+        if command_type == "INFERENCE":
             try:
                 inference_response = requests.post(
                     VLLM_CHAT_COMPLETIONS_URL,
-                    json=command["payload"],
+                    json=command.get("payload") or {},
                     timeout=300
                 )
                 inference_response.raise_for_status()
-                result = inference_response.json()
-
-                print(f"Command result: {result}")
-
                 complete_command(
-                    command["commandId"],
+                    command_id,
                     "COMPLETED",
-                    result
+                    inference_response.json()
                 )
             except Exception as error:
                 print(f"Inference error: {error}")
-                complete_command(
-                    command["commandId"],
-                    "FAILED",
-                    str(error)
-                )
+                complete_command(command_id, "FAILED", str(error), error=str(error))
+            return
+
+        if command_type in ("INSTALL_LLM", "OFFLOAD_LLM", "DELETE_LLM"):
+            with active_command_lock:
+                active_command_id = command_id
+            worker = threading.Thread(
+                target=handle_llm_command,
+                args=(command,),
+                daemon=True,
+                name=f"cmd-{command_id}"
+            )
+            worker.start()
+            return
+
+        print(f"Unknown command type: {command_type}")
+        complete_command(
+            command_id,
+            "FAILED",
+            f"Unknown command type: {command_type}",
+            error=f"Unknown command type: {command_type}"
+        )
     except Exception as error:
         print(f"Command polling error: {error}")
 
-def complete_command(command_id, status, result):
+
+def report_progress(
+    command_id,
+    phase,
+    message,
+    percent=None,
+    log_line=None
+):
+    body = {
+        "phase": phase,
+        "message": message,
+        "percent": percent,
+    }
+    if log_line:
+        body["log_line"] = log_line
+
     try:
+        response = requests.post(
+            f"{CONTROL_PLANE_URL}/machines/{MACHINE_ID}/commands/{command_id}/progress",
+            headers={
+                "Authorization": f"Bearer {AGENT_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json=body,
+            timeout=15
+        )
+        response.raise_for_status()
+        print(f"Progress [{phase}]: {message}")
+    except Exception as error:
+        print(f"Progress report error: {error}")
+
+
+def run_subprocess(command, timeout=None):
+    print("Running:", " ".join(command))
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        joined = " ".join(command)
+        raise RuntimeError(
+            f"Command failed ({result.returncode}): {joined}\n{stderr}"
+        )
+    return result
+
+
+def docker_available():
+    run_subprocess(["docker", "info"], timeout=30)
+
+
+def handle_install_llm(command_id, payload):
+    container_name = payload.get("containerName")
+    container_image = payload.get("containerImage")
+    model_path = payload.get("modelPath")
+    port = payload.get("port")
+
+    if not all([container_name, container_image, model_path, port]):
+        raise ValueError("INSTALL_LLM payload missing required fields")
+
+    report_progress(command_id, "validate", "Checking Docker", percent=5)
+    docker_available()
+
+    report_progress(
+        command_id,
+        "pull_image",
+        f"Pulling {container_image}",
+        percent=25,
+        log_line=f"docker pull {container_image}"
+    )
+    run_subprocess(["docker", "pull", container_image], timeout=3600)
+
+    # Remove any leftover container with the same name.
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        capture_output=True,
+        text=True
+    )
+
+    report_progress(
+        command_id,
+        "start_container",
+        f"Starting {container_name} on port {port}",
+        percent=70,
+        log_line=f"docker run {container_name}"
+    )
+    run_subprocess([
+        "docker", "run", "-d",
+        "--gpus", "all",
+        "-p", f"{port}:8000",
+        "--name", container_name,
+        "--restart", "unless-stopped",
+        container_image,
+        "--model", model_path,
+        "--host", "0.0.0.0",
+        "--port", "8000",
+    ], timeout=120)
+
+    report_progress(
+        command_id,
+        "health_check",
+        f"Waiting for http://127.0.0.1:{port}/v1/models",
+        percent=90
+    )
+    deadline = time.time() + 300
+    last_error = None
+    while time.time() < deadline:
+        try:
+            response = requests.get(
+                f"http://127.0.0.1:{port}/v1/models",
+                timeout=5
+            )
+            if response.status_code == 200:
+                report_progress(
+                    command_id,
+                    "health_check",
+                    "Model server is healthy",
+                    percent=95,
+                    log_line="health check ok"
+                )
+                complete_command(
+                    command_id,
+                    "COMPLETED",
+                    {
+                        "port": port,
+                        "container_name": container_name,
+                        "model_path": model_path
+                    }
+                )
+                return
+            last_error = f"HTTP {response.status_code}"
+        except Exception as error:
+            last_error = str(error)
+        time.sleep(5)
+
+    raise TimeoutError(
+        f"Model server did not become healthy: {last_error}"
+    )
+
+
+def handle_offload_llm(command_id, payload):
+    container_name = payload.get("containerName")
+    if not container_name:
+        raise ValueError("OFFLOAD_LLM payload missing containerName")
+
+    report_progress(
+        command_id,
+        "stop_container",
+        f"Stopping {container_name}",
+        percent=50,
+        log_line=f"docker stop {container_name}"
+    )
+    result = subprocess.run(
+        ["docker", "stop", container_name],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "no such container" not in stderr and "is not running" not in stderr:
+            raise RuntimeError(
+                f"docker stop failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    complete_command(
+        command_id,
+        "COMPLETED",
+        {"container_name": container_name, "action": "offloaded"}
+    )
+
+
+def handle_delete_llm(command_id, payload):
+    container_name = payload.get("containerName")
+    if not container_name:
+        raise ValueError("DELETE_LLM payload missing containerName")
+
+    report_progress(
+        command_id,
+        "stop_container",
+        f"Stopping {container_name}",
+        percent=30,
+        log_line=f"docker stop {container_name}"
+    )
+    subprocess.run(
+        ["docker", "stop", container_name],
+        capture_output=True,
+        text=True
+    )
+
+    report_progress(
+        command_id,
+        "remove_container",
+        f"Removing {container_name}",
+        percent=70,
+        log_line=f"docker rm -f {container_name}"
+    )
+    result = subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "no such container" not in stderr:
+            raise RuntimeError(
+                f"docker rm failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    complete_command(
+        command_id,
+        "COMPLETED",
+        {"container_name": container_name, "action": "deleted"}
+    )
+
+
+def handle_llm_command(command):
+    global active_command_id
+
+    command_id = command["commandId"]
+    command_type = command["type"]
+    payload = command.get("payload") or {}
+
+    try:
+        if command_type == "INSTALL_LLM":
+            handle_install_llm(command_id, payload)
+        elif command_type == "OFFLOAD_LLM":
+            handle_offload_llm(command_id, payload)
+        elif command_type == "DELETE_LLM":
+            handle_delete_llm(command_id, payload)
+        else:
+            raise ValueError(f"Unsupported LLM command: {command_type}")
+    except Exception as error:
+        print(f"{command_type} failed: {error}")
+        complete_command(
+            command_id,
+            "FAILED",
+            str(error),
+            error=str(error)
+        )
+    finally:
+        with active_command_lock:
+            if active_command_id == command_id:
+                active_command_id = None
+
+
+def complete_command(command_id, status, result, error=None):
+    try:
+        body = {
+            "status": status,
+            "result": result
+        }
+        if error is not None:
+            body["error"] = error
+
         response = requests.post(
             f"{CONTROL_PLANE_URL}/machines/{MACHINE_ID}/commands/{command_id}/complete",
             headers={
-                "Authorization": f"Bearer {AGENT_TOKEN}"
+                "Authorization": f"Bearer {AGENT_TOKEN}",
+                "Content-Type": "application/json"
             },
-            json={
-                "status": status,
-                "result": result
-            },
+            json=body,
             timeout=10
         )
 
@@ -289,8 +557,8 @@ def complete_command(command_id, status, result):
 
         print(f"Command completion: {response.json()}")
 
-    except Exception as error:
-        print(f"Command completion error: {error}")
+    except Exception as err:
+        print(f"Command completion error: {err}")
 
 
 def websocket_url():
