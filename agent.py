@@ -451,6 +451,7 @@ def handle_install_llm(command_id, payload):
     container_image = payload.get("containerImage")
     model_path = payload.get("modelPath")
     port = payload.get("port")
+    util = resolve_gpu_memory_utilization(payload)
 
     if not all([container_name, container_image, model_path, port]):
         raise ValueError("INSTALL_LLM payload missing required fields")
@@ -479,7 +480,7 @@ def handle_install_llm(command_id, payload):
         "start_container",
         f"Starting {container_name} on port {port}",
         percent=70,
-        log_line=f"docker run {container_name}"
+        log_line=f"docker run {container_name} util={util}"
     )
     run_subprocess([
         "docker", "run", "-d",
@@ -491,7 +492,7 @@ def handle_install_llm(command_id, payload):
         "--model", model_path,
         "--host", "0.0.0.0",
         "--port", "8000",
-        "--gpu-memory-utilization", "0.30",
+        "--gpu-memory-utilization", util,
         "--max-model-len", "2048",
     ], timeout=120)
 
@@ -502,7 +503,8 @@ def handle_install_llm(command_id, payload):
         {
             "port": port,
             "container_name": container_name,
-            "model_path": model_path
+            "model_path": model_path,
+            "gpu_memory_utilization": util,
         }
     )
 
@@ -582,11 +584,24 @@ def handle_delete_llm(command_id, payload):
     )
 
 
+def resolve_gpu_memory_utilization(payload):
+    raw = payload.get("gpuMemoryUtilization")
+    if raw is None:
+        return "0.30"
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return "0.30"
+    value = max(0.05, min(0.95, value))
+    return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
 def wait_for_model_health(command_id, port, timeout_seconds=300):
+    started = time.time()
     report_progress(
         command_id,
         "health_check",
-        f"Waiting for http://127.0.0.1:{port}/v1/models",
+        "Waiting for model server to become ready…",
         percent=90
     )
     deadline = time.time() + timeout_seconds
@@ -613,11 +628,13 @@ def wait_for_model_health(command_id, port, timeout_seconds=300):
 
         now = time.time()
         if now - last_health_report >= 10:
+            elapsed = int(now - started)
             report_progress(
                 command_id,
                 "health_check",
-                f"Waiting for model server… ({last_error or 'starting'})",
-                percent=90
+                f"Waiting for model server to become ready… ({elapsed}s)",
+                percent=90,
+                log_line=f"health poll: {last_error or 'starting'}"
             )
             last_health_report = now
         time.sleep(5)
@@ -632,6 +649,7 @@ def docker_run_vllm(command_id, payload):
     container_image = payload.get("containerImage")
     model_path = payload.get("modelPath")
     port = payload.get("port")
+    util = resolve_gpu_memory_utilization(payload)
 
     if not all([container_name, container_image, model_path, port]):
         raise ValueError("Missing fields for docker run (container/image/model/port)")
@@ -647,7 +665,7 @@ def docker_run_vllm(command_id, payload):
         "start_container",
         f"Starting {container_name} on port {port}",
         percent=70,
-        log_line=f"docker run {container_name}"
+        log_line=f"docker run {container_name} util={util}"
     )
     run_subprocess([
         "docker", "run", "-d",
@@ -659,7 +677,7 @@ def docker_run_vllm(command_id, payload):
         "--model", model_path,
         "--host", "0.0.0.0",
         "--port", "8000",
-        "--gpu-memory-utilization", "0.30",
+        "--gpu-memory-utilization", util,
         "--max-model-len", "2048",
     ], timeout=120)
 
