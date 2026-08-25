@@ -177,6 +177,36 @@ def get_storage_stats():
     return storage
 
 
+def get_lan_ip():
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "route", "get", "1.1.1.1"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.split()
+            if "src" in parts:
+                return parts[parts.index("src") + 1]
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["hostname", "-I"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().split()[0]
+    except Exception:
+        pass
+
+    return None
+
+
 def collect_telemetry():
     return {
         "gpus": get_gpu_stats(),
@@ -188,6 +218,16 @@ def collect_telemetry():
 
 def send_heartbeat():
     telemetry = collect_telemetry()
+    lan_ip = get_lan_ip()
+    body = {
+        "machine_id": MACHINE_ID,
+        "gpus": telemetry["gpus"],
+        "cpu": telemetry["cpu"],
+        "memory": telemetry["memory"],
+        "storage": telemetry["storage"],
+    }
+    if lan_ip:
+        body["lan_ip"] = lan_ip
 
     response = requests.post(
         f"{CONTROL_PLANE_URL}/machines/heartbeat",
@@ -195,13 +235,7 @@ def send_heartbeat():
             "Authorization": f"Bearer {AGENT_TOKEN}",
             "Content-Type": "application/json"
         },
-        json={
-            "machine_id": MACHINE_ID,
-            "gpus": telemetry["gpus"],
-            "cpu": telemetry["cpu"],
-            "memory": telemetry["memory"],
-            "storage": telemetry["storage"],
-        },
+        json=body,
         timeout=5
     )
 
@@ -213,6 +247,7 @@ def send_heartbeat():
         "cpu": telemetry["cpu"],
         "memory": telemetry["memory"],
         "storage": telemetry["storage"],
+        "lan_ip": lan_ip,
     })
 
 def poll_commands():
@@ -265,11 +300,18 @@ def poll_commands():
                 complete_command(command_id, "FAILED", str(error), error=str(error))
             return
 
-        if command_type in ("INSTALL_LLM", "OFFLOAD_LLM", "DELETE_LLM"):
+        if command_type in (
+            "INSTALL_LLM",
+            "OFFLOAD_LLM",
+            "ONLOAD_LLM",
+            "DELETE_LLM",
+            "RESTART_MACHINE",
+            "SHUTDOWN_MACHINE",
+        ):
             with active_command_lock:
                 active_command_id = command_id
             worker = threading.Thread(
-                target=handle_llm_command,
+                target=handle_queued_command,
                 args=(command,),
                 daemon=True,
                 name=f"cmd-{command_id}"
@@ -449,58 +491,19 @@ def handle_install_llm(command_id, payload):
         "--model", model_path,
         "--host", "0.0.0.0",
         "--port", "8000",
+        "--gpu-memory-utilization", "0.30",
+        "--max-model-len", "2048",
     ], timeout=120)
 
-    report_progress(
+    wait_for_model_health(command_id, port)
+    complete_command(
         command_id,
-        "health_check",
-        f"Waiting for http://127.0.0.1:{port}/v1/models",
-        percent=90
-    )
-    deadline = time.time() + 300
-    last_error = None
-    last_health_report = 0.0
-    while time.time() < deadline:
-        try:
-            response = requests.get(
-                f"http://127.0.0.1:{port}/v1/models",
-                timeout=5
-            )
-            if response.status_code == 200:
-                report_progress(
-                    command_id,
-                    "health_check",
-                    "Model server is healthy",
-                    percent=95,
-                    log_line="health check ok"
-                )
-                complete_command(
-                    command_id,
-                    "COMPLETED",
-                    {
-                        "port": port,
-                        "container_name": container_name,
-                        "model_path": model_path
-                    }
-                )
-                return
-            last_error = f"HTTP {response.status_code}"
-        except Exception as error:
-            last_error = str(error)
-
-        now = time.time()
-        if now - last_health_report >= 10:
-            report_progress(
-                command_id,
-                "health_check",
-                f"Waiting for model server… ({last_error or 'starting'})",
-                percent=90
-            )
-            last_health_report = now
-        time.sleep(5)
-
-    raise TimeoutError(
-        f"Model server did not become healthy: {last_error}"
+        "COMPLETED",
+        {
+            "port": port,
+            "container_name": container_name,
+            "model_path": model_path
+        }
     )
 
 
@@ -579,7 +582,167 @@ def handle_delete_llm(command_id, payload):
     )
 
 
-def handle_llm_command(command):
+def wait_for_model_health(command_id, port, timeout_seconds=300):
+    report_progress(
+        command_id,
+        "health_check",
+        f"Waiting for http://127.0.0.1:{port}/v1/models",
+        percent=90
+    )
+    deadline = time.time() + timeout_seconds
+    last_error = None
+    last_health_report = 0.0
+    while time.time() < deadline:
+        try:
+            response = requests.get(
+                f"http://127.0.0.1:{port}/v1/models",
+                timeout=5
+            )
+            if response.status_code == 200:
+                report_progress(
+                    command_id,
+                    "health_check",
+                    "Model server is healthy",
+                    percent=95,
+                    log_line="health check ok"
+                )
+                return
+            last_error = f"HTTP {response.status_code}"
+        except Exception as error:
+            last_error = str(error)
+
+        now = time.time()
+        if now - last_health_report >= 10:
+            report_progress(
+                command_id,
+                "health_check",
+                f"Waiting for model server… ({last_error or 'starting'})",
+                percent=90
+            )
+            last_health_report = now
+        time.sleep(5)
+
+    raise TimeoutError(
+        f"Model server did not become healthy: {last_error}"
+    )
+
+
+def docker_run_vllm(command_id, payload):
+    container_name = payload.get("containerName")
+    container_image = payload.get("containerImage")
+    model_path = payload.get("modelPath")
+    port = payload.get("port")
+
+    if not all([container_name, container_image, model_path, port]):
+        raise ValueError("Missing fields for docker run (container/image/model/port)")
+
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        capture_output=True,
+        text=True
+    )
+
+    report_progress(
+        command_id,
+        "start_container",
+        f"Starting {container_name} on port {port}",
+        percent=70,
+        log_line=f"docker run {container_name}"
+    )
+    run_subprocess([
+        "docker", "run", "-d",
+        "--gpus", "all",
+        "-p", f"{port}:8000",
+        "--name", container_name,
+        "--restart", "unless-stopped",
+        container_image,
+        "--model", model_path,
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--gpu-memory-utilization", "0.30",
+        "--max-model-len", "2048",
+    ], timeout=120)
+
+
+def handle_onload_llm(command_id, payload):
+    container_name = payload.get("containerName")
+    port = payload.get("port")
+    if not container_name or port is None:
+        raise ValueError("ONLOAD_LLM payload missing containerName or port")
+
+    report_progress(
+        command_id,
+        "start_container",
+        f"Starting {container_name}",
+        percent=40,
+        log_line=f"docker start {container_name}"
+    )
+    result = subprocess.run(
+        ["docker", "start", container_name],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").lower()
+        if "no such container" in stderr:
+            report_progress(
+                command_id,
+                "start_container",
+                "Container missing; recreating with docker run",
+                percent=50,
+                log_line="fallback docker run"
+            )
+            docker_run_vllm(command_id, payload)
+        else:
+            raise RuntimeError(
+                f"docker start failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    wait_for_model_health(command_id, port)
+    complete_command(
+        command_id,
+        "COMPLETED",
+        {
+            "port": port,
+            "container_name": container_name,
+            "action": "onloaded"
+        }
+    )
+
+
+def handle_power_command(command_id, command_type):
+    action = "reboot" if command_type == "RESTART_MACHINE" else "poweroff"
+    report_progress(
+        command_id,
+        "power",
+        f"Issuing systemctl {action}",
+        percent=50,
+        log_line=f"sudo -n systemctl {action}"
+    )
+    # Best-effort complete before host dies (may not arrive)
+    try:
+        complete_command(
+            command_id,
+            "COMPLETED",
+            {"action": action}
+        )
+    except Exception as error:
+        print(f"Pre-power complete failed (ok if host reboots): {error}")
+
+    result = subprocess.run(
+        ["sudo", "-n", "systemctl", action],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"sudo -n systemctl {action} failed: "
+            f"{(result.stderr or result.stdout).strip()}. "
+            "Ensure install.sh sudoers allows reboot/poweroff for the agent user."
+        )
+
+
+def handle_queued_command(command):
     global active_command_id
 
     command_id = command["commandId"]
@@ -591,10 +754,14 @@ def handle_llm_command(command):
             handle_install_llm(command_id, payload)
         elif command_type == "OFFLOAD_LLM":
             handle_offload_llm(command_id, payload)
+        elif command_type == "ONLOAD_LLM":
+            handle_onload_llm(command_id, payload)
         elif command_type == "DELETE_LLM":
             handle_delete_llm(command_id, payload)
+        elif command_type in ("RESTART_MACHINE", "SHUTDOWN_MACHINE"):
+            handle_power_command(command_id, command_type)
         else:
-            raise ValueError(f"Unsupported LLM command: {command_type}")
+            raise ValueError(f"Unsupported command: {command_type}")
     except Exception as error:
         print(f"{command_type} failed: {error}")
         complete_command(
