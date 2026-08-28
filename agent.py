@@ -11,7 +11,7 @@ import requests
 import websocket
 
 
-DEFAULT_CONTROL_PLANE_URL = "http://192.168.1.3:3000"
+DEFAULT_CONTROL_PLANE_URL = "http://192.168.1.12:3000"
 VLLM_CHAT_COMPLETIONS_URL = "http://localhost:8000/v1/chat/completions"
 CREDENTIALS_PATH = os.environ.get(
     "AI_NODE_CREDENTIALS_PATH",
