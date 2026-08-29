@@ -493,12 +493,58 @@ def vllm_docker_run_args(container_name, container_image, model_path, port, util
     ]
 
 
+def vllm_cpu_docker_run_args(container_name, container_image, model_path, port, ram_allocated_mb):
+    ensure_hf_cache_dir()
+    kv_cache_gb = max(1, int(ram_allocated_mb) // 1024)
+    return [
+        "docker", "run", "-d",
+        "--security-opt", "seccomp=unconfined",
+        "--shm-size", "4g",
+        "-p", f"{port}:8000",
+        "--name", container_name,
+        "--restart", "unless-stopped",
+        "-v", f"{HF_CACHE_HOST}:/root/.cache/huggingface",
+        "-e", f"VLLM_CPU_KVCACHE_SPACE={kv_cache_gb}",
+        container_image,
+        "--model", model_path,
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--max-model-len", "2048",
+    ]
+
+
+def docker_run_args_for_payload(payload):
+    runtime = payload.get("runtime") or "gpu"
+    container_name = payload.get("containerName")
+    container_image = payload.get("containerImage")
+    model_path = payload.get("modelPath")
+    port = payload.get("port")
+    if not all([container_name, container_image, model_path, port]):
+        raise ValueError("Missing fields for docker run (container/image/model/port)")
+
+    if runtime == "cpu":
+        ram_mb = payload.get("ramAllocatedMb") or 4096
+        return vllm_cpu_docker_run_args(
+            container_name, container_image, model_path, port, ram_mb
+        )
+
+    util = resolve_gpu_memory_utilization(payload)
+    return vllm_docker_run_args(
+        container_name, container_image, model_path, port, util
+    )
+
+
+def install_health_timeout_seconds(payload):
+    runtime = payload.get("runtime") or "gpu"
+    return 600 if runtime == "cpu" else 300
+
+
 def handle_install_llm(command_id, payload):
     container_name = payload.get("containerName")
     container_image = payload.get("containerImage")
     model_path = payload.get("modelPath")
     port = payload.get("port")
-    util = resolve_gpu_memory_utilization(payload)
+    runtime = payload.get("runtime") or "gpu"
 
     if not all([container_name, container_image, model_path, port]):
         raise ValueError("INSTALL_LLM payload missing required fields")
@@ -525,26 +571,31 @@ def handle_install_llm(command_id, payload):
     report_progress(
         command_id,
         "start_container",
-        f"Starting {container_name} on port {port}",
+        f"Starting {container_name} on port {port} ({runtime})",
         percent=70,
-        log_line=f"docker run {container_name} util={util}"
+        log_line=f"docker run {container_name} runtime={runtime}"
     )
     run_subprocess(
-        vllm_docker_run_args(container_name, container_image, model_path, port, util),
+        docker_run_args_for_payload(payload),
         timeout=120,
     )
 
-    wait_for_model_health(command_id, port)
-    complete_command(
+    wait_for_model_health(
         command_id,
-        "COMPLETED",
-        {
-            "port": port,
-            "container_name": container_name,
-            "model_path": model_path,
-            "gpu_memory_utilization": util,
-        }
+        port,
+        timeout_seconds=install_health_timeout_seconds(payload),
     )
+    result = {
+        "port": port,
+        "container_name": container_name,
+        "model_path": model_path,
+        "runtime": runtime,
+    }
+    if runtime == "cpu":
+        result["ram_allocated_mb"] = payload.get("ramAllocatedMb")
+    else:
+        result["gpu_memory_utilization"] = resolve_gpu_memory_utilization(payload)
+    complete_command(command_id, "COMPLETED", result)
 
 
 def handle_offload_llm(command_id, payload):
@@ -706,13 +757,11 @@ def wait_for_model_health(command_id, port, timeout_seconds=300):
 
 def docker_run_vllm(command_id, payload):
     container_name = payload.get("containerName")
-    container_image = payload.get("containerImage")
-    model_path = payload.get("modelPath")
     port = payload.get("port")
-    util = resolve_gpu_memory_utilization(payload)
+    runtime = payload.get("runtime") or "gpu"
 
-    if not all([container_name, container_image, model_path, port]):
-        raise ValueError("Missing fields for docker run (container/image/model/port)")
+    if not container_name or port is None:
+        raise ValueError("Missing fields for docker run (container/port)")
 
     subprocess.run(
         ["docker", "rm", "-f", container_name],
@@ -723,12 +772,12 @@ def docker_run_vllm(command_id, payload):
     report_progress(
         command_id,
         "start_container",
-        f"Starting {container_name} on port {port}",
+        f"Starting {container_name} on port {port} ({runtime})",
         percent=70,
-        log_line=f"docker run {container_name} util={util}"
+        log_line=f"docker run {container_name} runtime={runtime}"
     )
     run_subprocess(
-        vllm_docker_run_args(container_name, container_image, model_path, port, util),
+        docker_run_args_for_payload(payload),
         timeout=120,
     )
 
@@ -767,7 +816,11 @@ def handle_onload_llm(command_id, payload):
                 f"docker start failed: {(result.stderr or result.stdout).strip()}"
             )
 
-    wait_for_model_health(command_id, port)
+    wait_for_model_health(
+        command_id,
+        port,
+        timeout_seconds=install_health_timeout_seconds(payload),
+    )
     complete_command(
         command_id,
         "COMPLETED",
