@@ -11,12 +11,15 @@ import requests
 import websocket
 
 
-DEFAULT_CONTROL_PLANE_URL = "http://192.168.1.12:3000"
+DEFAULT_CONTROL_PLANE_URL = (
+    "http://private-ai-prod-alb-2007774676.ap-south-1.elb.amazonaws.com"
+)
 VLLM_CHAT_COMPLETIONS_URL = "http://localhost:8000/v1/chat/completions"
 CREDENTIALS_PATH = os.environ.get(
     "AI_NODE_CREDENTIALS_PATH",
     "/opt/ai-node/credentials.json"
 )
+HF_CACHE_HOST = os.environ.get("HF_CACHE_DIR", "/opt/ai-node/hf-cache")
 
 
 def load_credentials(path: str = CREDENTIALS_PATH) -> dict:
@@ -446,6 +449,50 @@ def docker_available():
     run_subprocess(["docker", "info"], timeout=30)
 
 
+def ensure_hf_cache_dir():
+    os.makedirs(HF_CACHE_HOST, exist_ok=True)
+
+
+def hf_hub_cache_dir(model_path: str) -> str:
+    """Hugging Face Hub cache folder for a repo id (org/name)."""
+    slug = model_path.strip().replace("/", "--")
+    return os.path.join(HF_CACHE_HOST, "hub", f"models--{slug}")
+
+
+def remove_hf_cache(model_path: str) -> bool:
+    """Delete downloaded model weights from the host HF cache. Returns True if removed."""
+    cache_dir = hf_hub_cache_dir(model_path)
+    existed = os.path.isdir(cache_dir)
+    hub_rel = os.path.relpath(cache_dir, HF_CACHE_HOST)
+    # Cache files are owned by root (written by the vLLM container). Use a
+    # short-lived container so deletion works when the agent runs unprivileged.
+    run_subprocess([
+        "docker", "run", "--rm",
+        "-v", f"{HF_CACHE_HOST}:/cache:rw",
+        "alpine:3",
+        "rm", "-rf", f"/cache/{hub_rel}",
+    ], timeout=300)
+    return existed
+
+
+def vllm_docker_run_args(container_name, container_image, model_path, port, util):
+    ensure_hf_cache_dir()
+    return [
+        "docker", "run", "-d",
+        "--gpus", "all",
+        "-p", f"{port}:8000",
+        "--name", container_name,
+        "--restart", "unless-stopped",
+        "-v", f"{HF_CACHE_HOST}:/root/.cache/huggingface",
+        container_image,
+        "--model", model_path,
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--gpu-memory-utilization", util,
+        "--max-model-len", "2048",
+    ]
+
+
 def handle_install_llm(command_id, payload):
     container_name = payload.get("containerName")
     container_image = payload.get("containerImage")
@@ -482,19 +529,10 @@ def handle_install_llm(command_id, payload):
         percent=70,
         log_line=f"docker run {container_name} util={util}"
     )
-    run_subprocess([
-        "docker", "run", "-d",
-        "--gpus", "all",
-        "-p", f"{port}:8000",
-        "--name", container_name,
-        "--restart", "unless-stopped",
-        container_image,
-        "--model", model_path,
-        "--host", "0.0.0.0",
-        "--port", "8000",
-        "--gpu-memory-utilization", util,
-        "--max-model-len", "2048",
-    ], timeout=120)
+    run_subprocess(
+        vllm_docker_run_args(container_name, container_image, model_path, port, util),
+        timeout=120,
+    )
 
     wait_for_model_health(command_id, port)
     complete_command(
@@ -542,6 +580,7 @@ def handle_offload_llm(command_id, payload):
 
 def handle_delete_llm(command_id, payload):
     container_name = payload.get("containerName")
+    model_path = payload.get("modelPath")
     if not container_name:
         raise ValueError("DELETE_LLM payload missing containerName")
 
@@ -549,7 +588,7 @@ def handle_delete_llm(command_id, payload):
         command_id,
         "stop_container",
         f"Stopping {container_name}",
-        percent=30,
+        percent=20,
         log_line=f"docker stop {container_name}"
     )
     subprocess.run(
@@ -562,11 +601,11 @@ def handle_delete_llm(command_id, payload):
         command_id,
         "remove_container",
         f"Removing {container_name}",
-        percent=70,
-        log_line=f"docker rm -f {container_name}"
+        percent=45,
+        log_line=f"docker rm -fv {container_name}"
     )
     result = subprocess.run(
-        ["docker", "rm", "-f", container_name],
+        ["docker", "rm", "-fv", container_name],
         capture_output=True,
         text=True
     )
@@ -577,10 +616,31 @@ def handle_delete_llm(command_id, payload):
                 f"docker rm failed: {(result.stderr or result.stdout).strip()}"
             )
 
+    cache_removed = False
+    if model_path:
+        report_progress(
+            command_id,
+            "remove_cache",
+            f"Removing model files for {model_path}",
+            percent=75,
+            log_line=f"rm -rf {hf_hub_cache_dir(model_path)}"
+        )
+        try:
+            cache_removed = remove_hf_cache(model_path)
+        except OSError as err:
+            raise RuntimeError(
+                f"Failed to remove model cache for {model_path}: {err}"
+            ) from err
+
     complete_command(
         command_id,
         "COMPLETED",
-        {"container_name": container_name, "action": "deleted"}
+        {
+            "container_name": container_name,
+            "model_path": model_path,
+            "cache_removed": cache_removed,
+            "action": "deleted",
+        }
     )
 
 
@@ -667,19 +727,10 @@ def docker_run_vllm(command_id, payload):
         percent=70,
         log_line=f"docker run {container_name} util={util}"
     )
-    run_subprocess([
-        "docker", "run", "-d",
-        "--gpus", "all",
-        "-p", f"{port}:8000",
-        "--name", container_name,
-        "--restart", "unless-stopped",
-        container_image,
-        "--model", model_path,
-        "--host", "0.0.0.0",
-        "--port", "8000",
-        "--gpu-memory-utilization", util,
-        "--max-model-len", "2048",
-    ], timeout=120)
+    run_subprocess(
+        vllm_docker_run_args(container_name, container_image, model_path, port, util),
+        timeout=120,
+    )
 
 
 def handle_onload_llm(command_id, payload):
