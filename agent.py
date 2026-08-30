@@ -493,23 +493,36 @@ def vllm_docker_run_args(container_name, container_image, model_path, port, util
     ]
 
 
+def cpu_kv_cache_gb(ram_allocated_mb):
+    """KV cache must share RAM with model weights — don't use the full budget."""
+    total_gb = max(1.0, ram_allocated_mb / 1024.0)
+    return max(2, min(16, int(total_gb * 0.35)))
+
+
 def vllm_cpu_docker_run_args(container_name, container_image, model_path, port, ram_allocated_mb):
     ensure_hf_cache_dir()
-    kv_cache_gb = max(1, int(ram_allocated_mb) // 1024)
+    kv_cache_gb = cpu_kv_cache_gb(ram_allocated_mb)
     return [
         "docker", "run", "-d",
+        "--cap-add", "SYS_NICE",
         "--security-opt", "seccomp=unconfined",
+        "--ipc=host",
         "--shm-size", "4g",
         "-p", f"{port}:8000",
         "--name", container_name,
         "--restart", "unless-stopped",
         "-v", f"{HF_CACHE_HOST}:/root/.cache/huggingface",
         "-e", f"VLLM_CPU_KVCACHE_SPACE={kv_cache_gb}",
+        "-e", "VLLM_CPU_OMP_THREADS_BIND=auto",
         container_image,
         "--model", model_path,
         "--host", "0.0.0.0",
         "--port", "8000",
-        "--max-model-len", "2048",
+        "--dtype", "bfloat16",
+        "--max-model-len", "512",
+        "--max-num-seqs", "4",
+        "--max-num-batched-tokens", "512",
+        "--trust-remote-code",
     ]
 
 
