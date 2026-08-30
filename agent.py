@@ -1316,9 +1316,15 @@ def _n8n_ensure_api_key(port, container_name):
                 f"Unexpected n8n api-key scopes response shape: {str(scopes_body)[:500]}"
             )
 
+        # Unix seconds, matching the `exp` unit n8n's own issued JWT API
+        # keys use. 1 year out — long enough to avoid re-provisioning on
+        # every restart; if this instance enforces a shorter max, the error
+        # below will say so and the duration can be adjusted.
+        expires_at = int(time.time()) + 365 * 24 * 3600
+
         created = session.post(
             f"{base_url}/rest/api-keys",
-            json={"label": "private-ai-agent", "scopes": all_scopes},
+            json={"label": "private-ai-agent", "scopes": all_scopes, "expiresAt": expires_at},
             timeout=15,
         )
         if not created.ok:
