@@ -486,6 +486,7 @@ def vllm_docker_run_args(container_name, container_image, model_path, port, util
         "-v", f"{HF_CACHE_HOST}:/root/.cache/huggingface",
         container_image,
         "--model", model_path,
+        "--served-model-name", model_path,
         "--host", "0.0.0.0",
         "--port", "8000",
         "--gpu-memory-utilization", util,
@@ -516,6 +517,7 @@ def vllm_cpu_docker_run_args(container_name, container_image, model_path, port, 
         "-e", "VLLM_CPU_OMP_THREADS_BIND=auto",
         container_image,
         "--model", model_path,
+        "--served-model-name", model_path,
         "--host", "0.0.0.0",
         "--port", "8000",
         "--dtype", "bfloat16",
@@ -593,7 +595,7 @@ def handle_install_llm(command_id, payload):
         timeout=120,
     )
 
-    wait_for_model_health(
+    served_model_id = wait_for_model_health(
         command_id,
         port,
         timeout_seconds=install_health_timeout_seconds(payload),
@@ -604,6 +606,8 @@ def handle_install_llm(command_id, payload):
         "model_path": model_path,
         "runtime": runtime,
     }
+    if served_model_id:
+        result["served_model_id"] = served_model_id
     if runtime == "cpu":
         result["ram_allocated_mb"] = payload.get("ramAllocatedMb")
     else:
@@ -720,6 +724,36 @@ def resolve_gpu_memory_utilization(payload):
     return f"{value:.4f}".rstrip("0").rstrip(".")
 
 
+def fetch_served_model_id(port):
+    response = requests.get(
+        f"http://127.0.0.1:{port}/v1/models",
+        timeout=10,
+    )
+    response.raise_for_status()
+    models = response.json().get("data") or []
+    if not models:
+        return None
+    return models[0].get("id")
+
+
+_served_model_by_port = {}
+
+
+def resolve_vllm_model_id(port, requested_model=None):
+    cached = _served_model_by_port.get(port)
+    if cached:
+        return cached
+    try:
+        served = fetch_served_model_id(port)
+    except Exception as error:
+        print(f"Could not resolve served model id on port {port}: {error}")
+        served = None
+    if served:
+        _served_model_by_port[int(port)] = served
+        return served
+    return requested_model
+
+
 def wait_for_model_health(command_id, port, timeout_seconds=300):
     started = time.time()
     report_progress(
@@ -731,6 +765,7 @@ def wait_for_model_health(command_id, port, timeout_seconds=300):
     deadline = time.time() + timeout_seconds
     last_error = None
     last_health_report = 0.0
+    served_model_id = None
     while time.time() < deadline:
         try:
             response = requests.get(
@@ -738,6 +773,11 @@ def wait_for_model_health(command_id, port, timeout_seconds=300):
                 timeout=5
             )
             if response.status_code == 200:
+                models = response.json().get("data") or []
+                if models:
+                    served_model_id = models[0].get("id")
+                    if served_model_id:
+                        _served_model_by_port[int(port)] = served_model_id
                 report_progress(
                     command_id,
                     "health_check",
@@ -745,7 +785,7 @@ def wait_for_model_health(command_id, port, timeout_seconds=300):
                     percent=95,
                     log_line="health check ok"
                 )
-                return
+                return served_model_id
             last_error = f"HTTP {response.status_code}"
         except Exception as error:
             last_error = str(error)
@@ -829,19 +869,22 @@ def handle_onload_llm(command_id, payload):
                 f"docker start failed: {(result.stderr or result.stdout).strip()}"
             )
 
-    wait_for_model_health(
+    served_model_id = wait_for_model_health(
         command_id,
         port,
         timeout_seconds=install_health_timeout_seconds(payload),
     )
+    onload_result = {
+        "port": port,
+        "container_name": container_name,
+        "action": "onloaded",
+    }
+    if served_model_id:
+        onload_result["served_model_id"] = served_model_id
     complete_command(
         command_id,
         "COMPLETED",
-        {
-            "port": port,
-            "container_name": container_name,
-            "action": "onloaded"
-        }
+        onload_result,
     )
 
 
@@ -959,14 +1002,29 @@ def format_inference_http_error(error):
     return str(error)
 
 
+def resolve_inference_target(payload):
+    """Return (port, request_body) for a vLLM chat/completions call."""
+    if isinstance(payload, dict) and "request" in payload and "port" in payload:
+        port = payload.get("port")
+        body = payload.get("request")
+        if port is None or not isinstance(body, dict):
+            raise ValueError("Inference payload must include port and request object")
+        return int(port), body
+    if isinstance(payload, dict):
+        return 8000, payload
+    raise ValueError("INFERENCE payload must be a JSON object")
+
+
 def handle_websocket_inference(ws, request_id, payload):
     try:
-        if not isinstance(payload, dict):
-            raise ValueError("INFERENCE payload must be a JSON object")
+        port, body = resolve_inference_target(payload)
+        body = dict(body)
+        body["model"] = resolve_vllm_model_id(port, body.get("model"))
+        inference_url = f"http://127.0.0.1:{port}/v1/chat/completions"
 
         inference_response = requests.post(
-            VLLM_CHAT_COMPLETIONS_URL,
-            json=payload,
+            inference_url,
+            json=body,
             timeout=300
         )
         inference_response.raise_for_status()
