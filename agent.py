@@ -1278,9 +1278,15 @@ def _n8n_ensure_api_key(port, container_name):
     api_key = None
     existing_keys = session.get(f"{base_url}/rest/api-keys", timeout=15)
     if existing_keys.ok:
-        keys = (existing_keys.json() or {}).get("data") or []
-        if keys:
-            api_key = keys[0].get("apiKey") or keys[0].get("rawApiKey")
+        keys_data = (existing_keys.json() or {}).get("data")
+        # This n8n version's /rest/api-keys can return either a list of key
+        # objects or a single key object directly under "data" (e.g. when
+        # only one personal API key is supported per user) — handle both
+        # rather than assuming a list shape.
+        if isinstance(keys_data, list) and keys_data:
+            api_key = keys_data[0].get("apiKey") or keys_data[0].get("rawApiKey")
+        elif isinstance(keys_data, dict) and keys_data:
+            api_key = keys_data.get("apiKey") or keys_data.get("rawApiKey")
     elif existing_keys.status_code != 401:
         print(
             f"n8n api-keys list returned {existing_keys.status_code}: "
@@ -1299,7 +1305,10 @@ def _n8n_ensure_api_key(port, container_name):
                 f"n8n api-key creation failed ({created.status_code}): "
                 f"{created.text[:500]} (session cookies present: {cookie_names})"
             )
-        created_data = (created.json() or {}).get("data") or created.json() or {}
+        created_body = created.json() or {}
+        created_data = created_body.get("data")
+        if not isinstance(created_data, dict):
+            created_data = created_body if isinstance(created_body, dict) else {}
         api_key = created_data.get("rawApiKey") or created_data.get("apiKey")
 
     if not api_key:
@@ -1440,12 +1449,17 @@ def handle_queued_command(command):
         else:
             raise ValueError(f"Unsupported command: {command_type}")
     except Exception as error:
-        print(f"{command_type} failed: {error}")
+        # Plain str(error) is unreadable for exceptions whose message is
+        # just their args (e.g. KeyError(0) stringifies to "0") — prefixing
+        # the exception type keeps failures diagnosable from the stored
+        # command/instance error field alone, without needing agent logs.
+        description = f"{type(error).__name__}: {error}"
+        print(f"{command_type} failed: {description}")
         complete_command(
             command_id,
             "FAILED",
-            str(error),
-            error=str(error)
+            description,
+            error=description
         )
     finally:
         with active_command_lock:
