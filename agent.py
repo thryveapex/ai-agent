@@ -1,9 +1,12 @@
+import base64
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from urllib.parse import urlparse
 
 import psutil
@@ -20,6 +23,8 @@ CREDENTIALS_PATH = os.environ.get(
     "/opt/ai-node/credentials.json"
 )
 HF_CACHE_HOST = os.environ.get("HF_CACHE_DIR", "/opt/ai-node/hf-cache")
+N8N_CONTAINER_PORT = 5678
+N8N_STATE_DIR = os.environ.get("N8N_AGENT_STATE_DIR", "/opt/ai-node/n8n-state")
 
 
 def load_credentials(path: str = CREDENTIALS_PATH) -> dict:
@@ -308,6 +313,12 @@ def poll_commands():
             "OFFLOAD_LLM",
             "ONLOAD_LLM",
             "DELETE_LLM",
+            "INSTALL_APP",
+            "OFFLOAD_APP",
+            "ONLOAD_APP",
+            "DELETE_APP",
+            "DEPLOY_WORKFLOW",
+            "REMOVE_WORKFLOW",
             "RESTART_MACHINE",
             "SHUTDOWN_MACHINE",
         ):
@@ -888,6 +899,436 @@ def handle_onload_llm(command_id, payload):
     )
 
 
+def app_docker_run_args(container_name, container_image, port, data_volume_name):
+    """Generic app container: no CLI flags appended, unlike vLLM's run args —
+    the image runs as-is. Only n8n uses this today, hence the fixed internal
+    port; if a second app type is added, make N8N_CONTAINER_PORT a payload
+    field instead of a module constant.
+    """
+    return [
+        "docker", "run", "-d",
+        "-p", f"{port}:{N8N_CONTAINER_PORT}",
+        "--name", container_name,
+        "--restart", "unless-stopped",
+        "-v", f"{data_volume_name}:/home/node/.n8n",
+        container_image,
+    ]
+
+
+def wait_for_app_health(command_id, port, timeout_seconds=180):
+    started = time.time()
+    report_progress(
+        command_id,
+        "health_check",
+        "Waiting for n8n to become ready…",
+        percent=90
+    )
+    deadline = time.time() + timeout_seconds
+    last_error = None
+    last_health_report = 0.0
+    while time.time() < deadline:
+        try:
+            response = requests.get(f"http://127.0.0.1:{port}/", timeout=5)
+            if response.status_code < 400:
+                report_progress(
+                    command_id,
+                    "health_check",
+                    "n8n is healthy",
+                    percent=95,
+                    log_line="health check ok"
+                )
+                return
+            last_error = f"HTTP {response.status_code}"
+        except Exception as error:
+            last_error = str(error)
+
+        now = time.time()
+        if now - last_health_report >= 10:
+            elapsed = int(now - started)
+            report_progress(
+                command_id,
+                "health_check",
+                f"Waiting for n8n to become ready… ({elapsed}s)",
+                percent=90,
+                log_line=f"health poll: {last_error or 'starting'}"
+            )
+            last_health_report = now
+        time.sleep(5)
+
+    raise TimeoutError(f"n8n did not become healthy: {last_error}")
+
+
+_container_name_by_port = {}
+
+
+def handle_install_app(command_id, payload):
+    container_name = payload.get("containerName")
+    container_image = payload.get("containerImage")
+    port = payload.get("port")
+    data_volume_name = payload.get("dataVolumeName")
+
+    if not all([container_name, container_image, port, data_volume_name]):
+        raise ValueError("INSTALL_APP payload missing required fields")
+
+    report_progress(command_id, "validate", "Checking Docker", percent=5)
+    docker_available()
+
+    report_progress(
+        command_id,
+        "pull_image",
+        f"Pulling {container_image}",
+        percent=25,
+        log_line=f"docker pull {container_image}"
+    )
+    docker_pull_with_progress(command_id, container_image, timeout=1200)
+
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        capture_output=True,
+        text=True
+    )
+
+    report_progress(
+        command_id,
+        "start_container",
+        f"Starting {container_name} on port {port}",
+        percent=70,
+        log_line=f"docker run {container_name}"
+    )
+    run_subprocess(
+        app_docker_run_args(container_name, container_image, port, data_volume_name),
+        timeout=120,
+    )
+
+    wait_for_app_health(command_id, port, timeout_seconds=180)
+    _container_name_by_port[int(port)] = container_name
+
+    complete_command(
+        command_id,
+        "COMPLETED",
+        {
+            "port": port,
+            "container_name": container_name,
+            "data_volume_name": data_volume_name,
+        }
+    )
+
+
+def handle_offload_app(command_id, payload):
+    container_name = payload.get("containerName")
+    if not container_name:
+        raise ValueError("OFFLOAD_APP payload missing containerName")
+
+    report_progress(
+        command_id,
+        "stop_container",
+        f"Stopping {container_name}",
+        percent=50,
+        log_line=f"docker stop {container_name}"
+    )
+    result = subprocess.run(
+        ["docker", "stop", container_name],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "no such container" not in stderr and "is not running" not in stderr:
+            raise RuntimeError(
+                f"docker stop failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    complete_command(
+        command_id,
+        "COMPLETED",
+        {"container_name": container_name, "action": "offloaded"}
+    )
+
+
+def handle_onload_app(command_id, payload):
+    container_name = payload.get("containerName")
+    port = payload.get("port")
+    if not container_name or port is None:
+        raise ValueError("ONLOAD_APP payload missing containerName or port")
+
+    report_progress(
+        command_id,
+        "start_container",
+        f"Starting {container_name}",
+        percent=40,
+        log_line=f"docker start {container_name}"
+    )
+    result = subprocess.run(
+        ["docker", "start", container_name],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").lower()
+        if "no such container" in stderr:
+            container_image = payload.get("containerImage")
+            data_volume_name = payload.get("dataVolumeName")
+            if not container_image or not data_volume_name:
+                raise ValueError(
+                    "Container missing and cannot recreate: missing "
+                    "containerImage/dataVolumeName"
+                )
+            report_progress(
+                command_id,
+                "start_container",
+                "Container missing; recreating with docker run",
+                percent=50,
+                log_line="fallback docker run"
+            )
+            run_subprocess(
+                app_docker_run_args(container_name, container_image, port, data_volume_name),
+                timeout=120,
+            )
+        else:
+            raise RuntimeError(
+                f"docker start failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    wait_for_app_health(command_id, port, timeout_seconds=180)
+    _container_name_by_port[int(port)] = container_name
+
+    complete_command(
+        command_id,
+        "COMPLETED",
+        {"port": port, "container_name": container_name, "action": "onloaded"}
+    )
+
+
+def handle_delete_app(command_id, payload):
+    container_name = payload.get("containerName")
+    data_volume_name = payload.get("dataVolumeName")
+    if not container_name:
+        raise ValueError("DELETE_APP payload missing containerName")
+
+    report_progress(
+        command_id,
+        "stop_container",
+        f"Stopping {container_name}",
+        percent=20,
+        log_line=f"docker stop {container_name}"
+    )
+    subprocess.run(
+        ["docker", "stop", container_name],
+        capture_output=True,
+        text=True
+    )
+
+    report_progress(
+        command_id,
+        "remove_container",
+        f"Removing {container_name}",
+        percent=45,
+        log_line=f"docker rm -fv {container_name}"
+    )
+    result = subprocess.run(
+        ["docker", "rm", "-fv", container_name],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "no such container" not in stderr:
+            raise RuntimeError(
+                f"docker rm failed: {(result.stderr or result.stdout).strip()}"
+            )
+
+    # Unlike the shared HF cache (a read-mostly cache safe to prune by
+    # sub-path), this volume is exclusive to one n8n instance — removing it
+    # is real, irreversible data loss, gated by confirm=true at the API layer.
+    volume_removed = False
+    if data_volume_name:
+        report_progress(
+            command_id,
+            "remove_volume",
+            f"Removing volume {data_volume_name}",
+            percent=80,
+            log_line=f"docker volume rm {data_volume_name}"
+        )
+        vol_result = subprocess.run(
+            ["docker", "volume", "rm", data_volume_name],
+            capture_output=True,
+            text=True
+        )
+        if vol_result.returncode == 0:
+            volume_removed = True
+        else:
+            stderr = (vol_result.stderr or "").lower()
+            if "no such volume" not in stderr:
+                raise RuntimeError(
+                    f"docker volume rm failed: "
+                    f"{(vol_result.stderr or vol_result.stdout).strip()}"
+                )
+
+    complete_command(
+        command_id,
+        "COMPLETED",
+        {
+            "container_name": container_name,
+            "data_volume_name": data_volume_name,
+            "volume_removed": volume_removed,
+            "action": "deleted",
+        }
+    )
+
+
+def _n8n_owner_state_path(container_name):
+    return os.path.join(N8N_STATE_DIR, f"{container_name}.json")
+
+
+_n8n_api_key_by_port = {}
+
+
+def _n8n_ensure_api_key(port, container_name):
+    """Bootstrap a non-interactive owner account + Public API key for this
+    n8n instance, on first use, and cache/reuse it afterward for the life of
+    the process (re-fetched from n8n on next agent restart via the cached
+    owner credentials, not re-created).
+
+    NOTE — verification spike: this targets the REST shape used by n8n's own
+    setup wizard (`/rest/owner/setup`, `/rest/login`, `/rest/api-keys`) as of
+    the version pinned by the control plane's N8N_CONTAINER_IMAGE. This is
+    not a documented/stable public contract — confirm it against that exact
+    image tag before relying on it in production. If it changes, only this
+    function needs updating; nothing else in the workflow/credential flow
+    depends on the exact bootstrap mechanism.
+    """
+    cached = _n8n_api_key_by_port.get(int(port))
+    if cached:
+        return cached
+
+    os.makedirs(N8N_STATE_DIR, exist_ok=True)
+    state_path = _n8n_owner_state_path(container_name)
+    base_url = f"http://127.0.0.1:{port}"
+
+    if os.path.isfile(state_path):
+        with open(state_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    else:
+        state = {
+            "email": f"owner-{uuid.uuid4().hex[:12]}@local.invalid",
+            "password": secrets.token_urlsafe(24),
+        }
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.chmod(state_path, 0o600)
+
+    session = requests.Session()
+
+    # First run creates the owner account; on an already-set-up instance
+    # this 4xxs harmlessly and we fall through to login.
+    session.post(
+        f"{base_url}/rest/owner/setup",
+        json={
+            "email": state["email"],
+            "firstName": "Private",
+            "lastName": "AI",
+            "password": state["password"],
+        },
+        timeout=15,
+    )
+
+    login_response = session.post(
+        f"{base_url}/rest/login",
+        json={"email": state["email"], "password": state["password"]},
+        timeout=15,
+    )
+    login_response.raise_for_status()
+
+    api_key = None
+    existing_keys = session.get(f"{base_url}/rest/api-keys", timeout=15)
+    if existing_keys.ok:
+        keys = (existing_keys.json() or {}).get("data") or []
+        if keys:
+            api_key = keys[0].get("apiKey") or keys[0].get("rawApiKey")
+
+    if not api_key:
+        created = session.post(
+            f"{base_url}/rest/api-keys",
+            json={"label": "private-ai-agent"},
+            timeout=15,
+        )
+        created.raise_for_status()
+        created_data = (created.json() or {}).get("data") or created.json() or {}
+        api_key = created_data.get("rawApiKey") or created_data.get("apiKey")
+
+    if not api_key:
+        raise RuntimeError("Could not obtain an n8n Public API key")
+
+    _n8n_api_key_by_port[int(port)] = api_key
+    return api_key
+
+
+def handle_deploy_workflow(command_id, payload):
+    workflow_id = payload.get("workflowId")
+    container_name = payload.get("containerName")
+    port = payload.get("port")
+    workflow_json = payload.get("workflowJson")
+
+    if not all([workflow_id, container_name, port, workflow_json]):
+        raise ValueError("DEPLOY_WORKFLOW payload missing required fields")
+
+    report_progress(command_id, "authenticate", "Authenticating with n8n", percent=20)
+    api_key = _n8n_ensure_api_key(port, container_name)
+    headers = {"X-N8N-API-KEY": api_key, "Content-Type": "application/json"}
+    base_url = f"http://127.0.0.1:{port}"
+
+    report_progress(command_id, "import", "Importing workflow", percent=50)
+    create_body = {
+        "name": workflow_json.get("name") or f"workflow-{workflow_id[:8]}",
+        "nodes": workflow_json.get("nodes", []),
+        "connections": workflow_json.get("connections", {}),
+        "settings": workflow_json.get("settings") or {},
+    }
+    create_response = requests.post(
+        f"{base_url}/api/v1/workflows",
+        json=create_body,
+        headers=headers,
+        timeout=30,
+    )
+    create_response.raise_for_status()
+    n8n_workflow_id = create_response.json().get("id")
+    if not n8n_workflow_id:
+        raise RuntimeError("n8n did not return a workflow id")
+
+    report_progress(command_id, "activate", "Activating workflow", percent=80)
+    activate_response = requests.post(
+        f"{base_url}/api/v1/workflows/{n8n_workflow_id}/activate",
+        headers=headers,
+        timeout=30,
+    )
+    activate_response.raise_for_status()
+
+    complete_command(command_id, "COMPLETED", {"n8n_workflow_id": n8n_workflow_id})
+
+
+def handle_remove_workflow(command_id, payload):
+    container_name = payload.get("containerName")
+    port = payload.get("port")
+    n8n_workflow_id = payload.get("n8nWorkflowId")
+
+    if not container_name or port is None:
+        raise ValueError("REMOVE_WORKFLOW payload missing containerName or port")
+
+    if n8n_workflow_id:
+        report_progress(command_id, "delete", "Removing workflow from n8n", percent=50)
+        api_key = _n8n_ensure_api_key(port, container_name)
+        headers = {"X-N8N-API-KEY": api_key}
+        delete_response = requests.delete(
+            f"http://127.0.0.1:{port}/api/v1/workflows/{n8n_workflow_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if delete_response.status_code not in (200, 204, 404):
+            delete_response.raise_for_status()
+
+    complete_command(command_id, "COMPLETED", {"action": "removed"})
+
+
 def handle_power_command(command_id, command_type):
     action = "reboot" if command_type == "RESTART_MACHINE" else "poweroff"
     report_progress(
@@ -936,6 +1377,18 @@ def handle_queued_command(command):
             handle_onload_llm(command_id, payload)
         elif command_type == "DELETE_LLM":
             handle_delete_llm(command_id, payload)
+        elif command_type == "INSTALL_APP":
+            handle_install_app(command_id, payload)
+        elif command_type == "OFFLOAD_APP":
+            handle_offload_app(command_id, payload)
+        elif command_type == "ONLOAD_APP":
+            handle_onload_app(command_id, payload)
+        elif command_type == "DELETE_APP":
+            handle_delete_app(command_id, payload)
+        elif command_type == "DEPLOY_WORKFLOW":
+            handle_deploy_workflow(command_id, payload)
+        elif command_type == "REMOVE_WORKFLOW":
+            handle_remove_workflow(command_id, payload)
         elif command_type in ("RESTART_MACHINE", "SHUTDOWN_MACHINE"):
             handle_power_command(command_id, command_type)
         else:
@@ -1054,6 +1507,102 @@ def handle_websocket_inference(ws, request_id, payload):
         print(f"WebSocket inference send error: {request_id}: {error}")
 
 
+def handle_websocket_webhook_call(ws, request_id, payload):
+    try:
+        port = payload.get("port")
+        method = payload.get("method")
+        path = payload.get("path")
+        headers = payload.get("headers") or {}
+        body_b64 = payload.get("body")
+
+        if port is None or not method or not path:
+            raise ValueError("WEBHOOK_CALL payload missing port/method/path")
+
+        body = base64.b64decode(body_b64) if body_b64 else None
+        webhook_response = requests.request(
+            method,
+            f"http://127.0.0.1:{port}{path}",
+            headers=headers,
+            data=body,
+            timeout=60
+        )
+
+        response_body = webhook_response.content
+        response = {
+            "type": "WEBHOOK_CALL_RESULT",
+            "request_id": request_id,
+            "success": True,
+            "result": {
+                "status": webhook_response.status_code,
+                "headers": dict(webhook_response.headers),
+                "body": base64.b64encode(response_body).decode("ascii") if response_body else None,
+            }
+        }
+
+        print(f"WebSocket webhook call completed: {request_id}")
+    except Exception as error:
+        response = {
+            "type": "WEBHOOK_CALL_RESULT",
+            "request_id": request_id,
+            "success": False,
+            "error": str(error)
+        }
+
+        print(f"WebSocket webhook call error: {request_id}: {response['error']}")
+
+    try:
+        send_websocket_message(ws, response)
+    except Exception as error:
+        print(f"WebSocket webhook call send error: {request_id}: {error}")
+
+
+def handle_websocket_credential_set(ws, request_id, payload):
+    try:
+        port = payload.get("port")
+        name = payload.get("name")
+        credential_type = payload.get("type")
+        data = payload.get("data")
+
+        if port is None or not name or not credential_type or not isinstance(data, dict):
+            raise ValueError("CREDENTIAL_SET payload missing port/name/type/data")
+
+        container_name = _container_name_by_port.get(int(port), f"n8n-port-{port}")
+        api_key = _n8n_ensure_api_key(port, container_name)
+
+        create_response = requests.post(
+            f"http://127.0.0.1:{port}/api/v1/credentials",
+            json={"name": name, "type": credential_type, "data": data},
+            headers={"X-N8N-API-KEY": api_key, "Content-Type": "application/json"},
+            timeout=30
+        )
+        create_response.raise_for_status()
+        n8n_credential_id = create_response.json().get("id")
+
+        response = {
+            "type": "CREDENTIAL_SET_RESULT",
+            "request_id": request_id,
+            "success": True,
+            "result": {"n8n_credential_id": n8n_credential_id}
+        }
+
+        print(f"WebSocket credential set completed: {request_id}")
+    except Exception as error:
+        # Deliberately never log `data` above — it contains the secret.
+        response = {
+            "type": "CREDENTIAL_SET_RESULT",
+            "request_id": request_id,
+            "success": False,
+            "error": format_inference_http_error(error)
+        }
+
+        print(f"WebSocket credential set error: {request_id}: {response['error']}")
+
+    try:
+        send_websocket_message(ws, response)
+    except Exception as error:
+        print(f"WebSocket credential set send error: {request_id}: {error}")
+
+
 def connect_websocket():
     url = websocket_url()
     reconnect_delay_seconds = 5
@@ -1086,6 +1635,44 @@ def connect_websocket():
                     name=f"inference-{request_id}"
                 )
                 inference_thread.start()
+                return
+
+            if data.get("type") == "WEBHOOK_CALL":
+                request_id = data.get("request_id")
+                payload = data.get("payload")
+
+                if not request_id:
+                    print("WebSocket webhook call missing request_id")
+                    return
+
+                print(f"Received WebSocket webhook call: {request_id}")
+
+                webhook_thread = threading.Thread(
+                    target=handle_websocket_webhook_call,
+                    args=(ws, request_id, payload),
+                    daemon=True,
+                    name=f"webhook-{request_id}"
+                )
+                webhook_thread.start()
+                return
+
+            if data.get("type") == "CREDENTIAL_SET":
+                request_id = data.get("request_id")
+                payload = data.get("payload")
+
+                if not request_id:
+                    print("WebSocket credential set missing request_id")
+                    return
+
+                print(f"Received WebSocket credential set: {request_id}")
+
+                credential_thread = threading.Thread(
+                    target=handle_websocket_credential_set,
+                    args=(ws, request_id, payload),
+                    daemon=True,
+                    name=f"credential-{request_id}"
+                )
+                credential_thread.start()
         except json.JSONDecodeError:
             print(f"WebSocket invalid message: {message}")
         except Exception as error:
