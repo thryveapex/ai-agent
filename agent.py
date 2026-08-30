@@ -1221,11 +1221,13 @@ def _n8n_ensure_api_key(port, container_name):
 
     session = requests.Session()
 
-    # First run creates the owner account; on an already-set-up instance
-    # this 4xxs — that's expected and we fall through to login. Any other
-    # failure reason is logged (not raised) so it's visible without blocking
-    # the login attempt, which will usually fail too and carry the same root
-    # cause in its own error body.
+    # First run creates the owner account — and n8n logs the caller in as a
+    # side effect of a successful setup, via the same session's cookie. Only
+    # call /rest/login explicitly when setup did NOT just succeed (i.e. the
+    # instance was already set up from an earlier run); calling login a
+    # second time right after a fresh setup risks stepping on/replacing that
+    # already-valid session, which is the likely cause of a 401 on the
+    # api-keys call further down despite setup+login both reporting success.
     setup_response = session.post(
         f"{base_url}/rest/owner/setup",
         json={
@@ -1236,28 +1238,35 @@ def _n8n_ensure_api_key(port, container_name):
         },
         timeout=15,
     )
-    if not setup_response.ok and "already" not in setup_response.text.lower():
-        print(
-            f"n8n owner setup returned {setup_response.status_code} "
-            f"(continuing to login attempt): {setup_response.text[:500]}"
-        )
 
-    login_response = session.post(
-        f"{base_url}/rest/login",
-        # Field name for the identifier varies across n8n versions (plain
-        # `email` vs. LDAP-aware `emailOrLdapLoginId`) — send both so
-        # whichever schema this image expects gets a value.
-        json={
-            "email": state["email"],
-            "emailOrLdapLoginId": state["email"],
-            "password": state["password"],
-        },
-        timeout=15,
-    )
-    if not login_response.ok:
+    if not setup_response.ok:
+        if "already" not in setup_response.text.lower():
+            print(
+                f"n8n owner setup returned {setup_response.status_code} "
+                f"(attempting login anyway): {setup_response.text[:500]}"
+            )
+        login_response = session.post(
+            f"{base_url}/rest/login",
+            # Field name for the identifier varies across n8n versions
+            # (plain `email` vs. LDAP-aware `emailOrLdapLoginId`) — send
+            # both so whichever schema this image expects gets a value.
+            json={
+                "email": state["email"],
+                "emailOrLdapLoginId": state["email"],
+                "password": state["password"],
+            },
+            timeout=15,
+        )
+        if not login_response.ok:
+            raise RuntimeError(
+                f"n8n login failed ({login_response.status_code}): "
+                f"{login_response.text[:500]}"
+            )
+
+    if not session.cookies:
         raise RuntimeError(
-            f"n8n login failed ({login_response.status_code}): "
-            f"{login_response.text[:500]}"
+            "n8n setup/login reported success but no session cookie was set "
+            "— cannot make authenticated API calls"
         )
 
     api_key = None
@@ -1266,6 +1275,11 @@ def _n8n_ensure_api_key(port, container_name):
         keys = (existing_keys.json() or {}).get("data") or []
         if keys:
             api_key = keys[0].get("apiKey") or keys[0].get("rawApiKey")
+    elif existing_keys.status_code != 401:
+        print(
+            f"n8n api-keys list returned {existing_keys.status_code}: "
+            f"{existing_keys.text[:500]}"
+        )
 
     if not api_key:
         created = session.post(
@@ -1274,9 +1288,10 @@ def _n8n_ensure_api_key(port, container_name):
             timeout=15,
         )
         if not created.ok:
+            cookie_names = ",".join(session.cookies.keys()) or "none"
             raise RuntimeError(
                 f"n8n api-key creation failed ({created.status_code}): "
-                f"{created.text[:500]}"
+                f"{created.text[:500]} (session cookies present: {cookie_names})"
             )
         created_data = (created.json() or {}).get("data") or created.json() or {}
         api_key = created_data.get("rawApiKey") or created_data.get("apiKey")
