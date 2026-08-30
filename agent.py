@@ -1294,9 +1294,31 @@ def _n8n_ensure_api_key(port, container_name):
         )
 
     if not api_key:
+        # This n8n version requires an explicit `scopes` array (a "scoped
+        # API keys" feature) — its create-key modal offers an "All" preset
+        # that resolves to every scope the instance supports. Fetch that
+        # same list rather than hardcoding scope strings that could drift
+        # across n8n versions.
+        # NOTE: `/rest/api-keys/scopes` is a best guess at the endpoint the
+        # UI itself must call to populate its scope checkboxes — if this
+        # 404s, the error below will show the real response so the correct
+        # path/shape can be swapped in.
+        scopes_response = session.get(f"{base_url}/rest/api-keys/scopes", timeout=15)
+        if not scopes_response.ok:
+            raise RuntimeError(
+                f"n8n api-key scopes lookup failed ({scopes_response.status_code}): "
+                f"{scopes_response.text[:500]}"
+            )
+        scopes_body = scopes_response.json() or {}
+        all_scopes = scopes_body.get("data") if isinstance(scopes_body, dict) else scopes_body
+        if not isinstance(all_scopes, list) or not all_scopes:
+            raise RuntimeError(
+                f"Unexpected n8n api-key scopes response shape: {str(scopes_body)[:500]}"
+            )
+
         created = session.post(
             f"{base_url}/rest/api-keys",
-            json={"label": "private-ai-agent"},
+            json={"label": "private-ai-agent", "scopes": all_scopes},
             timeout=15,
         )
         if not created.ok:
