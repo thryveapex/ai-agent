@@ -1346,6 +1346,17 @@ def _n8n_ensure_api_key(port, container_name):
     return api_key
 
 
+def _raise_for_n8n_response(response, context):
+    """Like response.raise_for_status(), but the error carries n8n's actual
+    response body — plain raise_for_status() only gives a generic
+    "400 Client Error" with no indication of what n8n actually rejected.
+    """
+    if not response.ok:
+        raise RuntimeError(
+            f"n8n {context} failed ({response.status_code}): {response.text[:1000]}"
+        )
+
+
 def handle_deploy_workflow(command_id, payload):
     workflow_id = payload.get("workflowId")
     container_name = payload.get("containerName")
@@ -1373,7 +1384,7 @@ def handle_deploy_workflow(command_id, payload):
         headers=headers,
         timeout=30,
     )
-    create_response.raise_for_status()
+    _raise_for_n8n_response(create_response, "workflow creation")
     n8n_workflow_id = create_response.json().get("id")
     if not n8n_workflow_id:
         raise RuntimeError("n8n did not return a workflow id")
@@ -1384,7 +1395,7 @@ def handle_deploy_workflow(command_id, payload):
         headers=headers,
         timeout=30,
     )
-    activate_response.raise_for_status()
+    _raise_for_n8n_response(activate_response, "workflow activation")
 
     complete_command(command_id, "COMPLETED", {"n8n_workflow_id": n8n_workflow_id})
 
@@ -1407,7 +1418,7 @@ def handle_remove_workflow(command_id, payload):
             timeout=30,
         )
         if delete_response.status_code not in (200, 204, 404):
-            delete_response.raise_for_status()
+            _raise_for_n8n_response(delete_response, "workflow deletion")
 
     complete_command(command_id, "COMPLETED", {"action": "removed"})
 
@@ -1663,7 +1674,7 @@ def handle_websocket_credential_set(ws, request_id, payload):
             headers={"X-N8N-API-KEY": api_key, "Content-Type": "application/json"},
             timeout=30
         )
-        create_response.raise_for_status()
+        _raise_for_n8n_response(create_response, "credential creation")
         n8n_credential_id = create_response.json().get("id")
 
         response = {
