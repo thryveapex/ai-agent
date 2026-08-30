@@ -1346,6 +1346,32 @@ def _n8n_ensure_api_key(port, container_name):
     return api_key
 
 
+def _n8n_authed_request(port, container_name, method, path, **kwargs):
+    """Call n8n's Public API with the cached API key, retrying once with a
+    freshly provisioned key if the call comes back 401 — the cached key can
+    go stale for reasons outside the agent's control (e.g. someone deletes
+    it from n8n's own Settings > API page, or its expiry passes).
+    """
+    headers = kwargs.pop("headers", {})
+    api_key = _n8n_ensure_api_key(port, container_name)
+    response = requests.request(
+        method,
+        f"http://127.0.0.1:{port}{path}",
+        headers={**headers, "X-N8N-API-KEY": api_key},
+        **kwargs,
+    )
+    if response.status_code == 401:
+        _n8n_api_key_by_port.pop(int(port), None)
+        api_key = _n8n_ensure_api_key(port, container_name)
+        response = requests.request(
+            method,
+            f"http://127.0.0.1:{port}{path}",
+            headers={**headers, "X-N8N-API-KEY": api_key},
+            **kwargs,
+        )
+    return response
+
+
 def _raise_for_n8n_response(response, context):
     """Like response.raise_for_status(), but the error carries n8n's actual
     response body — plain raise_for_status() only gives a generic
@@ -1367,9 +1393,6 @@ def handle_deploy_workflow(command_id, payload):
         raise ValueError("DEPLOY_WORKFLOW payload missing required fields")
 
     report_progress(command_id, "authenticate", "Authenticating with n8n", percent=20)
-    api_key = _n8n_ensure_api_key(port, container_name)
-    headers = {"X-N8N-API-KEY": api_key, "Content-Type": "application/json"}
-    base_url = f"http://127.0.0.1:{port}"
 
     report_progress(command_id, "import", "Importing workflow", percent=50)
     create_body = {
@@ -1378,10 +1401,10 @@ def handle_deploy_workflow(command_id, payload):
         "connections": workflow_json.get("connections", {}),
         "settings": workflow_json.get("settings") or {},
     }
-    create_response = requests.post(
-        f"{base_url}/api/v1/workflows",
+    create_response = _n8n_authed_request(
+        port, container_name, "POST", "/api/v1/workflows",
         json=create_body,
-        headers=headers,
+        headers={"Content-Type": "application/json"},
         timeout=30,
     )
     _raise_for_n8n_response(create_response, "workflow creation")
@@ -1390,9 +1413,8 @@ def handle_deploy_workflow(command_id, payload):
         raise RuntimeError("n8n did not return a workflow id")
 
     report_progress(command_id, "activate", "Activating workflow", percent=80)
-    activate_response = requests.post(
-        f"{base_url}/api/v1/workflows/{n8n_workflow_id}/activate",
-        headers=headers,
+    activate_response = _n8n_authed_request(
+        port, container_name, "POST", f"/api/v1/workflows/{n8n_workflow_id}/activate",
         timeout=30,
     )
     _raise_for_n8n_response(activate_response, "workflow activation")
@@ -1410,11 +1432,8 @@ def handle_remove_workflow(command_id, payload):
 
     if n8n_workflow_id:
         report_progress(command_id, "delete", "Removing workflow from n8n", percent=50)
-        api_key = _n8n_ensure_api_key(port, container_name)
-        headers = {"X-N8N-API-KEY": api_key}
-        delete_response = requests.delete(
-            f"http://127.0.0.1:{port}/api/v1/workflows/{n8n_workflow_id}",
-            headers=headers,
+        delete_response = _n8n_authed_request(
+            port, container_name, "DELETE", f"/api/v1/workflows/{n8n_workflow_id}",
             timeout=30,
         )
         if delete_response.status_code not in (200, 204, 404):
@@ -1666,13 +1685,12 @@ def handle_websocket_credential_set(ws, request_id, payload):
             raise ValueError("CREDENTIAL_SET payload missing port/name/type/data")
 
         container_name = _container_name_by_port.get(int(port), f"n8n-port-{port}")
-        api_key = _n8n_ensure_api_key(port, container_name)
 
-        create_response = requests.post(
-            f"http://127.0.0.1:{port}/api/v1/credentials",
+        create_response = _n8n_authed_request(
+            port, container_name, "POST", "/api/v1/credentials",
             json={"name": name, "type": credential_type, "data": data},
-            headers={"X-N8N-API-KEY": api_key, "Content-Type": "application/json"},
-            timeout=30
+            headers={"Content-Type": "application/json"},
+            timeout=30,
         )
         _raise_for_n8n_response(create_response, "credential creation")
         n8n_credential_id = create_response.json().get("id")
