@@ -911,6 +911,12 @@ def app_docker_run_args(container_name, container_image, port, data_volume_name)
         "--name", container_name,
         "--restart", "unless-stopped",
         "-v", f"{data_volume_name}:/home/node/.n8n",
+        # Every hop to this container is plain HTTP (agent -> 127.0.0.1, and
+        # direct LAN access for manual debugging) — no TLS in front of it.
+        # n8n's default Secure-flagged auth cookie never gets sent back over
+        # HTTP, which silently breaks session auth (login "succeeds" but the
+        # cookie is dropped on the next request) without this.
+        "-e", "N8N_SECURE_COOKIE=false",
         container_image,
     ]
 
