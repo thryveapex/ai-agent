@@ -1209,9 +1209,11 @@ def _n8n_ensure_api_key(port, container_name):
         with open(state_path, "r", encoding="utf-8") as handle:
             state = json.load(handle)
     else:
+        # Suffix guarantees n8n's password-complexity check (upper+lower+digit)
+        # passes regardless of what token_urlsafe happens to generate.
         state = {
             "email": f"owner-{uuid.uuid4().hex[:12]}@local.invalid",
-            "password": secrets.token_urlsafe(24),
+            "password": secrets.token_urlsafe(24) + "aA1",
         }
         with open(state_path, "w", encoding="utf-8") as handle:
             json.dump(state, handle)
@@ -1220,8 +1222,11 @@ def _n8n_ensure_api_key(port, container_name):
     session = requests.Session()
 
     # First run creates the owner account; on an already-set-up instance
-    # this 4xxs harmlessly and we fall through to login.
-    session.post(
+    # this 4xxs — that's expected and we fall through to login. Any other
+    # failure reason is logged (not raised) so it's visible without blocking
+    # the login attempt, which will usually fail too and carry the same root
+    # cause in its own error body.
+    setup_response = session.post(
         f"{base_url}/rest/owner/setup",
         json={
             "email": state["email"],
@@ -1231,13 +1236,29 @@ def _n8n_ensure_api_key(port, container_name):
         },
         timeout=15,
     )
+    if not setup_response.ok and "already" not in setup_response.text.lower():
+        print(
+            f"n8n owner setup returned {setup_response.status_code} "
+            f"(continuing to login attempt): {setup_response.text[:500]}"
+        )
 
     login_response = session.post(
         f"{base_url}/rest/login",
-        json={"email": state["email"], "password": state["password"]},
+        # Field name for the identifier varies across n8n versions (plain
+        # `email` vs. LDAP-aware `emailOrLdapLoginId`) — send both so
+        # whichever schema this image expects gets a value.
+        json={
+            "email": state["email"],
+            "emailOrLdapLoginId": state["email"],
+            "password": state["password"],
+        },
         timeout=15,
     )
-    login_response.raise_for_status()
+    if not login_response.ok:
+        raise RuntimeError(
+            f"n8n login failed ({login_response.status_code}): "
+            f"{login_response.text[:500]}"
+        )
 
     api_key = None
     existing_keys = session.get(f"{base_url}/rest/api-keys", timeout=15)
@@ -1252,7 +1273,11 @@ def _n8n_ensure_api_key(port, container_name):
             json={"label": "private-ai-agent"},
             timeout=15,
         )
-        created.raise_for_status()
+        if not created.ok:
+            raise RuntimeError(
+                f"n8n api-key creation failed ({created.status_code}): "
+                f"{created.text[:500]}"
+            )
         created_data = (created.json() or {}).get("data") or created.json() or {}
         api_key = created_data.get("rawApiKey") or created_data.get("apiKey")
 
