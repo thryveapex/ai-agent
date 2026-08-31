@@ -622,7 +622,8 @@ def docker_run_args_for_payload(payload):
 
 def install_health_timeout_seconds(payload):
     runtime = payload.get("runtime") or "gpu"
-    return 600 if runtime == "cpu" else 300
+    # GPU first boot often downloads multi-GB weights then loads VRAM; 5m was too short.
+    return 600 if runtime == "cpu" else 900
 
 
 def handle_install_llm(command_id, payload):
