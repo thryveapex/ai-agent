@@ -392,8 +392,41 @@ def run_subprocess(command, timeout=None):
     return result
 
 
+def docker_image_present(container_image):
+    result = subprocess.run(
+        ["docker", "image", "inspect", container_image],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return result.returncode == 0
+
+
+def _pull_progress_percent(line):
+    lower = line.lower()
+    if "downloading" in lower:
+        return 35
+    if "extracting" in lower or "extract" in lower:
+        return 50
+    if "pull complete" in lower or "digest:" in lower or "status: downloaded" in lower:
+        return 60
+    if "waiting" in lower or "verifying" in lower:
+        return 55
+    return 25
+
+
 def docker_pull_with_progress(command_id, container_image, timeout=3600):
     """Pull image while streaming layer progress to control plane."""
+    if docker_image_present(container_image):
+        report_progress(
+            command_id,
+            "pull_image",
+            f"Using cached image {container_image}",
+            percent=65,
+            log_line=f"docker image inspect {container_image} (cached)",
+        )
+        return
+
     command = ["docker", "pull", container_image]
     print("Running:", " ".join(command))
 
@@ -402,12 +435,38 @@ def docker_pull_with_progress(command_id, container_image, timeout=3600):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1
+        bufsize=1,
     )
 
     last_report = 0.0
     last_line = ""
+    last_percent = 25
     deadline = time.time() + timeout
+    stop_heartbeat = threading.Event()
+
+    def pull_heartbeat():
+        nonlocal last_line, last_percent
+        while not stop_heartbeat.wait(30):
+            if process.poll() is not None:
+                return
+            message = last_line or (
+                f"Still pulling {container_image} — large GPU image layers can "
+                "take 30–60 min with no new log lines while extracting"
+            )
+            report_progress(
+                command_id,
+                "pull_image",
+                message[:500],
+                percent=last_percent,
+                log_line=message[:500],
+            )
+
+    heartbeat = threading.Thread(
+        target=pull_heartbeat,
+        daemon=True,
+        name=f"pull-heartbeat-{command_id}",
+    )
+    heartbeat.start()
 
     try:
         assert process.stdout is not None
@@ -419,23 +478,14 @@ def docker_pull_with_progress(command_id, container_image, timeout=3600):
             last_line = line
 
             now = time.time()
+            last_percent = _pull_progress_percent(line)
             if now - last_report >= 5 or "Pull complete" in line or "Status:" in line:
-                # Map pull sub-steps into 25–65% of overall install progress.
-                percent = 25
-                lower = line.lower()
-                if "downloading" in lower:
-                    percent = 35
-                elif "extracting" in lower:
-                    percent = 50
-                elif "pull complete" in lower or "digest:" in lower:
-                    percent = 60
-
                 report_progress(
                     command_id,
                     "pull_image",
                     line[:500],
-                    percent=percent,
-                    log_line=line[:500]
+                    percent=last_percent,
+                    log_line=line[:500],
                 )
                 last_report = now
 
@@ -449,11 +499,21 @@ def docker_pull_with_progress(command_id, container_image, timeout=3600):
     except Exception:
         process.kill()
         raise
+    finally:
+        stop_heartbeat.set()
 
     if return_code != 0:
         raise RuntimeError(
             f"docker pull failed ({return_code}): {container_image}\n{last_line}"
         )
+
+    report_progress(
+        command_id,
+        "pull_image",
+        f"Pulled {container_image}",
+        percent=65,
+        log_line=f"docker pull {container_image} (complete)",
+    )
 
 
 def docker_available():
@@ -585,7 +645,27 @@ def handle_install_llm(command_id, payload):
         percent=25,
         log_line=f"docker pull {container_image}"
     )
-    docker_pull_with_progress(command_id, container_image, timeout=3600)
+    pull_attempts = 3
+    last_error = None
+    for attempt in range(1, pull_attempts + 1):
+        try:
+            docker_pull_with_progress(command_id, container_image, timeout=3600)
+            last_error = None
+            break
+        except Exception as error:
+            last_error = error
+            if attempt >= pull_attempts:
+                raise
+            report_progress(
+                command_id,
+                "pull_image",
+                f"Pull failed (attempt {attempt}/{pull_attempts}): {error}. Retrying…",
+                percent=25,
+                log_line=str(error)[:500],
+            )
+            time.sleep(5)
+    if last_error:
+        raise last_error
 
     # Remove any leftover container with the same name.
     subprocess.run(
