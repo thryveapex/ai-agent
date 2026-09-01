@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -344,6 +345,25 @@ def poll_commands():
         print(f"Command polling error: {error}")
 
 
+class InstallError(Exception):
+    """Raised for install/onload failures with a taxonomy error_code (see
+    private-ai-cp's shared/constants.py INSTALL_ERROR_TAXONOMY) so the
+    backend can render a specific, actionable message instead of a raw
+    exception string. `detail` is the raw diagnostic (docker logs, etc.) —
+    stored as errorDetail, not shown to the user by default.
+    """
+
+    def __init__(self, error_code, message, detail=None):
+        self.error_code = error_code
+        self.detail = detail
+        super().__init__(message)
+
+
+class InstallCancelled(Exception):
+    """Raised when a cancel signal was observed and honored mid-install —
+    handle_queued_command completes this as CANCELLED, not FAILED."""
+
+
 def report_progress(
     command_id,
     phase,
@@ -371,8 +391,19 @@ def report_progress(
         )
         response.raise_for_status()
         print(f"Progress [{phase}]: {message}")
+        return response.json()
     except Exception as error:
         print(f"Progress report error: {error}")
+        return None
+
+
+def raise_if_cancelled(progress_response):
+    """report_progress already round-trips to the control plane every few
+    seconds during long phases — piggyback the cancel check on that instead
+    of a separate poll, so honoring a cancel request is prompt without extra
+    load."""
+    if progress_response and progress_response.get("cancel_requested"):
+        raise InstallCancelled()
 
 
 def run_subprocess(command, timeout=None):
@@ -390,6 +421,52 @@ def run_subprocess(command, timeout=None):
             f"Command failed ({result.returncode}): {joined}\n{stderr}"
         )
     return result
+
+
+def _extract_container_id(run_result):
+    """`docker run -d` prints the new container's full ID as the last
+    stdout line on success."""
+    if not run_result or not run_result.stdout:
+        return None
+    lines = [line.strip() for line in run_result.stdout.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+    candidate = lines[-1]
+    return candidate if re.fullmatch(r"[0-9a-f]{12,64}", candidate) else None
+
+
+def docker_container_state(container_name):
+    """Returns {"status": "running"|"exited"|..., "exit_code": int} or None
+    if the container doesn't exist / inspect fails — used to tell "still
+    starting" apart from "already crashed" during health-check polling,
+    instead of waiting out the full timeout on a dead container.
+    """
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Status}}|{{.State.ExitCode}}", container_name],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        return None
+    output = (result.stdout or "").strip()
+    if "|" not in output:
+        return None
+    status, _, exit_code = output.partition("|")
+    try:
+        return {"status": status, "exit_code": int(exit_code)}
+    except ValueError:
+        return {"status": status, "exit_code": None}
+
+
+def docker_container_logs(container_name, tail=100):
+    result = subprocess.run(
+        ["docker", "logs", "--tail", str(tail), container_name],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return (result.stdout or "") + (result.stderr or "")
 
 
 def docker_image_present(container_image):
@@ -415,12 +492,48 @@ def _pull_progress_percent(line):
     return 25
 
 
+_LAYER_PROGRESS_RE = re.compile(
+    r"^[0-9a-f]{12}:\s*(?:Downloading|Extracting)\s*\[.*?\]\s*"
+    r"([\d.]+)\s*([kKmMgG]?B)\s*/\s*([\d.]+)\s*([kKmMgG]?B)"
+)
+_SIZE_MULTIPLIERS = {"b": 1, "kb": 1024, "mb": 1024 ** 2, "gb": 1024 ** 3}
+
+
+def _parse_size(value, unit):
+    return float(value) * _SIZE_MULTIPLIERS.get(unit.lower(), 1)
+
+
+def _real_pull_percent(line, layer_bytes):
+    """Docker's non-TTY pull output still prints periodic per-layer
+    "Downloading [===>   ] 4.2MB/9.7MB" lines — parse and sum them for a
+    real byte-based percent instead of the fixed-keyword guess, when the
+    format is there to parse. Returns None (caller falls back to the
+    keyword-based estimate) when it isn't.
+    """
+    match = _LAYER_PROGRESS_RE.match(line)
+    if not match:
+        return None
+    layer_id = line.split(":", 1)[0]
+    downloaded = _parse_size(match.group(1), match.group(2))
+    total = _parse_size(match.group(3), match.group(4))
+    if total <= 0:
+        return None
+    layer_bytes[layer_id] = (downloaded, total)
+    total_downloaded = sum(d for d, _ in layer_bytes.values())
+    total_size = sum(t for _, t in layer_bytes.values())
+    if total_size <= 0:
+        return None
+    fraction = min(1.0, total_downloaded / total_size)
+    # This phase occupies roughly 25-65% of the overall install progress.
+    return 25 + fraction * 40, total_downloaded, total_size
+
+
 def docker_pull_with_progress(command_id, container_image, timeout=3600):
     """Pull image while streaming layer progress to control plane."""
     if docker_image_present(container_image):
         report_progress(
             command_id,
-            "pull_image",
+            "DOWNLOADING",
             f"Using cached image {container_image}",
             percent=65,
             log_line=f"docker image inspect {container_image} (cached)",
@@ -441,6 +554,7 @@ def docker_pull_with_progress(command_id, container_image, timeout=3600):
     last_report = 0.0
     last_line = ""
     last_percent = 25
+    layer_bytes = {}
     deadline = time.time() + timeout
     stop_heartbeat = threading.Event()
 
@@ -453,13 +567,15 @@ def docker_pull_with_progress(command_id, container_image, timeout=3600):
                 f"Still pulling {container_image} — large GPU image layers can "
                 "take 30–60 min with no new log lines while extracting"
             )
-            report_progress(
+            progress_response = report_progress(
                 command_id,
-                "pull_image",
+                "DOWNLOADING",
                 message[:500],
                 percent=last_percent,
                 log_line=message[:500],
             )
+            if progress_response and progress_response.get("cancel_requested"):
+                process.kill()
 
     heartbeat = threading.Thread(
         target=pull_heartbeat,
@@ -478,24 +594,41 @@ def docker_pull_with_progress(command_id, container_image, timeout=3600):
             last_line = line
 
             now = time.time()
-            last_percent = _pull_progress_percent(line)
+            byte_progress = _real_pull_percent(line, layer_bytes)
+            if byte_progress:
+                last_percent, downloaded, total = byte_progress
+                display_message = (
+                    f"Downloading model image — "
+                    f"{downloaded / (1024 * 1024):.0f} MB / {total / (1024 * 1024):.0f} MB"
+                )
+            else:
+                last_percent = _pull_progress_percent(line)
+                display_message = line[:500]
+
             if now - last_report >= 5 or "Pull complete" in line or "Status:" in line:
-                report_progress(
+                progress_response = report_progress(
                     command_id,
-                    "pull_image",
-                    line[:500],
+                    "DOWNLOADING",
+                    display_message,
                     percent=last_percent,
                     log_line=line[:500],
                 )
                 last_report = now
+                if progress_response and progress_response.get("cancel_requested"):
+                    process.kill()
+                    raise InstallCancelled()
 
             if now > deadline:
                 process.kill()
-                raise TimeoutError(
-                    f"docker pull timed out after {timeout}s: {container_image}"
+                raise InstallError(
+                    "DOWNLOAD_FAILED",
+                    f"docker pull timed out after {timeout}s: {container_image}",
                 )
 
         return_code = process.wait(timeout=30)
+    except (InstallCancelled, InstallError):
+        process.kill()
+        raise
     except Exception:
         process.kill()
         raise
@@ -503,13 +636,15 @@ def docker_pull_with_progress(command_id, container_image, timeout=3600):
         stop_heartbeat.set()
 
     if return_code != 0:
-        raise RuntimeError(
-            f"docker pull failed ({return_code}): {container_image}\n{last_line}"
+        raise InstallError(
+            "DOWNLOAD_FAILED",
+            f"Failed to download the model image (exit code {return_code}).",
+            detail=f"docker pull {container_image}\n{last_line}",
         )
 
     report_progress(
         command_id,
-        "pull_image",
+        "DOWNLOADING",
         f"Pulled {container_image}",
         percent=65,
         log_line=f"docker pull {container_image} (complete)",
@@ -626,6 +761,42 @@ def install_health_timeout_seconds(payload):
     return 600 if runtime == "cpu" else 900
 
 
+def revalidate_resources_before_run(payload):
+    """Last-second guard immediately before `docker run` — resources can
+    change between the control plane's preflight check and now (e.g. a
+    second install raced this one and consumed VRAM in between). The
+    control plane stays the authoritative decision-maker; this is a final
+    safety net, not a second admission-control system, so it fails open
+    (returns quietly) whenever it can't get a confident reading rather than
+    blocking an install over a telemetry hiccup.
+    """
+    runtime = payload.get("runtime") or "gpu"
+    if runtime == "cpu":
+        required_mb = payload.get("ramAllocatedMb")
+        if not required_mb:
+            return
+        free_mb = psutil.virtual_memory().available / (1024 * 1024)
+        if free_mb < float(required_mb):
+            raise InstallError(
+                "INSUFFICIENT_RAM",
+                f"Not enough free RAM right before starting: need {required_mb} MB, have {int(free_mb)} MB.",
+            )
+    else:
+        required_mb = payload.get("vramAllocatedMb")
+        if not required_mb:
+            return
+        try:
+            gpus = get_gpu_stats()
+        except Exception:
+            return
+        free_mb = sum(max(0, g["memory_total"] - g["memory_used"]) for g in gpus)
+        if free_mb < float(required_mb):
+            raise InstallError(
+                "INSUFFICIENT_VRAM",
+                f"Not enough free VRAM right before starting: need {required_mb} MB, have {int(free_mb)} MB.",
+            )
+
+
 def handle_install_llm(command_id, payload):
     container_name = payload.get("containerName")
     container_image = payload.get("containerImage")
@@ -636,12 +807,12 @@ def handle_install_llm(command_id, payload):
     if not all([container_name, container_image, model_path, port]):
         raise ValueError("INSTALL_LLM payload missing required fields")
 
-    report_progress(command_id, "validate", "Checking Docker", percent=5)
+    report_progress(command_id, "VALIDATING", "Checking Docker", percent=5)
     docker_available()
 
     report_progress(
         command_id,
-        "pull_image",
+        "DOWNLOADING",
         f"Pulling {container_image} (this can take 20–40 min on first run)",
         percent=25,
         log_line=f"docker pull {container_image}"
@@ -653,13 +824,15 @@ def handle_install_llm(command_id, payload):
             docker_pull_with_progress(command_id, container_image, timeout=3600)
             last_error = None
             break
+        except InstallCancelled:
+            raise
         except Exception as error:
             last_error = error
             if attempt >= pull_attempts:
                 raise
             report_progress(
                 command_id,
-                "pull_image",
+                "DOWNLOADING",
                 f"Pull failed (attempt {attempt}/{pull_attempts}): {error}. Retrying…",
                 percent=25,
                 log_line=str(error)[:500],
@@ -668,28 +841,39 @@ def handle_install_llm(command_id, payload):
     if last_error:
         raise last_error
 
+    report_progress(command_id, "PREPARING", "Preparing container", percent=68)
     # Remove any leftover container with the same name.
     subprocess.run(
         ["docker", "rm", "-f", container_name],
         capture_output=True,
         text=True
     )
+    revalidate_resources_before_run(payload)
 
     report_progress(
         command_id,
-        "start_container",
+        "STARTING",
         f"Starting {container_name} on port {port} ({runtime})",
         percent=70,
         log_line=f"docker run {container_name} runtime={runtime}"
     )
-    run_subprocess(
+    run_result = run_subprocess(
         docker_run_args_for_payload(payload),
         timeout=120,
+    )
+    container_id = _extract_container_id(run_result)
+
+    report_progress(
+        command_id,
+        "LOADING_MODEL",
+        "Container started — waiting for the model to load",
+        percent=80,
     )
 
     served_model_id = wait_for_model_health(
         command_id,
         port,
+        container_name,
         timeout_seconds=install_health_timeout_seconds(payload),
     )
     result = {
@@ -698,6 +882,8 @@ def handle_install_llm(command_id, payload):
         "model_path": model_path,
         "runtime": runtime,
     }
+    if container_id:
+        result["container_id"] = container_id
     if served_model_id:
         result["served_model_id"] = served_model_id
     if runtime == "cpu":
@@ -846,11 +1032,41 @@ def resolve_vllm_model_id(port, requested_model=None):
     return requested_model
 
 
-def wait_for_model_health(command_id, port, timeout_seconds=300):
+def smoke_test_inference(port, model_id):
+    """One real, tiny completion request — READY should mean "a request
+    would actually succeed," not just "the container exists and /v1/models
+    responds." Raises InstallError(MODEL_LOAD_FAILED) on a genuine failure.
+    """
+    try:
+        response = requests.post(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            json={
+                "model": model_id or "default",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            },
+            timeout=30,
+        )
+    except Exception as error:
+        raise InstallError(
+            "MODEL_LOAD_FAILED",
+            "The model server is up but a test inference request failed.",
+            detail=str(error),
+        ) from error
+
+    if response.status_code != 200:
+        raise InstallError(
+            "MODEL_LOAD_FAILED",
+            f"The model server is up but a test inference request failed (HTTP {response.status_code}).",
+            detail=(response.text or "")[:2000],
+        )
+
+
+def wait_for_model_health(command_id, port, container_name, timeout_seconds=300):
     started = time.time()
     report_progress(
         command_id,
-        "health_check",
+        "HEALTH_CHECKING",
         "Waiting for model server to become ready…",
         percent=90
     )
@@ -870,33 +1086,59 @@ def wait_for_model_health(command_id, port, timeout_seconds=300):
                     served_model_id = models[0].get("id")
                     if served_model_id:
                         _served_model_by_port[int(port)] = served_model_id
+
                 report_progress(
                     command_id,
-                    "health_check",
+                    "HEALTH_CHECKING",
+                    "Model server responded — confirming it can actually serve a request",
+                    percent=93,
+                )
+                smoke_test_inference(port, served_model_id)
+
+                report_progress(
+                    command_id,
+                    "HEALTH_CHECKING",
                     "Model server is healthy",
                     percent=95,
-                    log_line="health check ok"
+                    log_line="health check + smoke test ok"
                 )
                 return served_model_id
             last_error = f"HTTP {response.status_code}"
+        except InstallError:
+            raise
         except Exception as error:
             last_error = str(error)
+
+        # The container may have crashed rather than "still starting" — don't
+        # wait out the whole timeout to discover that.
+        state = docker_container_state(container_name) if container_name else None
+        if state and state.get("status") not in ("running", "created"):
+            logs = docker_container_logs(container_name)
+            raise InstallError(
+                "CONTAINER_FAILED",
+                f"The container exited unexpectedly "
+                f"(status: {state.get('status')}, exit code: {state.get('exit_code')}).",
+                detail=logs[-4000:],
+            )
 
         now = time.time()
         if now - last_health_report >= 10:
             elapsed = int(now - started)
-            report_progress(
+            progress_response = report_progress(
                 command_id,
-                "health_check",
+                "HEALTH_CHECKING",
                 f"Waiting for model server to become ready… ({elapsed}s)",
                 percent=90,
                 log_line=f"health poll: {last_error or 'starting'}"
             )
+            raise_if_cancelled(progress_response)
             last_health_report = now
         time.sleep(5)
 
-    raise TimeoutError(
-        f"Model server did not become healthy: {last_error}"
+    raise InstallError(
+        "HEALTH_CHECK_TIMEOUT",
+        f"Model server did not become healthy within {timeout_seconds}s: {last_error}",
+        detail=docker_container_logs(container_name)[-4000:] if container_name else None,
     )
 
 
@@ -914,17 +1156,20 @@ def docker_run_vllm(command_id, payload):
         text=True
     )
 
+    revalidate_resources_before_run(payload)
+
     report_progress(
         command_id,
-        "start_container",
+        "STARTING",
         f"Starting {container_name} on port {port} ({runtime})",
         percent=70,
         log_line=f"docker run {container_name} runtime={runtime}"
     )
-    run_subprocess(
+    run_result = run_subprocess(
         docker_run_args_for_payload(payload),
         timeout=120,
     )
+    return _extract_container_id(run_result)
 
 
 def handle_onload_llm(command_id, payload):
@@ -935,11 +1180,12 @@ def handle_onload_llm(command_id, payload):
 
     report_progress(
         command_id,
-        "start_container",
+        "STARTING",
         f"Starting {container_name}",
         percent=40,
         log_line=f"docker start {container_name}"
     )
+    container_id = None
     result = subprocess.run(
         ["docker", "start", container_name],
         capture_output=True,
@@ -950,20 +1196,30 @@ def handle_onload_llm(command_id, payload):
         if "no such container" in stderr:
             report_progress(
                 command_id,
-                "start_container",
+                "STARTING",
                 "Container missing; recreating with docker run",
                 percent=50,
                 log_line="fallback docker run"
             )
-            docker_run_vllm(command_id, payload)
+            container_id = docker_run_vllm(command_id, payload)
         else:
-            raise RuntimeError(
-                f"docker start failed: {(result.stderr or result.stdout).strip()}"
+            raise InstallError(
+                "CONTAINER_FAILED",
+                "Could not start the container.",
+                detail=(result.stderr or result.stdout).strip(),
             )
+
+    report_progress(
+        command_id,
+        "LOADING_MODEL",
+        "Container started — waiting for the model to load",
+        percent=80,
+    )
 
     served_model_id = wait_for_model_health(
         command_id,
         port,
+        container_name,
         timeout_seconds=install_health_timeout_seconds(payload),
     )
     onload_result = {
@@ -971,6 +1227,8 @@ def handle_onload_llm(command_id, payload):
         "container_name": container_name,
         "action": "onloaded",
     }
+    if container_id:
+        onload_result["container_id"] = container_id
     if served_model_id:
         onload_result["served_model_id"] = served_model_id
     complete_command(
@@ -1628,6 +1886,24 @@ def handle_queued_command(command):
             handle_power_command(command_id, command_type)
         else:
             raise ValueError(f"Unsupported command: {command_type}")
+    except InstallCancelled:
+        # Best-effort cleanup of whatever got created before the cancel
+        # signal was observed — a container name is the only thing every
+        # install/onload payload has in common at this point.
+        container_name = payload.get("containerName")
+        if container_name:
+            subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, text=True)
+        print(f"{command_type} cancelled by user")
+        complete_command(command_id, "CANCELLED", "Cancelled by user")
+    except InstallError as error:
+        print(f"{command_type} failed [{error.error_code}]: {error}")
+        complete_command(
+            command_id,
+            "FAILED",
+            str(error),
+            error=str(error),
+            error_code=error.error_code,
+        )
     except Exception as error:
         # Plain str(error) is unreadable for exceptions whose message is
         # just their args (e.g. KeyError(0) stringifies to "0") — prefixing
@@ -1647,7 +1923,7 @@ def handle_queued_command(command):
                 active_command_id = None
 
 
-def complete_command(command_id, status, result, error=None):
+def complete_command(command_id, status, result, error=None, error_code=None):
     try:
         body = {
             "status": status,
@@ -1655,6 +1931,8 @@ def complete_command(command_id, status, result, error=None):
         }
         if error is not None:
             body["error"] = error
+        if error_code is not None:
+            body["error_code"] = error_code
 
         response = requests.post(
             f"{CONTROL_PLANE_URL}/machines/{MACHINE_ID}/commands/{command_id}/complete",
