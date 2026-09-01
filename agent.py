@@ -1270,11 +1270,45 @@ def _n8n_owner_state_path(container_name):
 _n8n_api_key_by_port = {}
 
 
+def _n8n_write_state(state_path, state):
+    with open(state_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    os.chmod(state_path, 0o600)
+
+
+def _n8n_forget_api_key(port, container_name):
+    """Drop both the in-memory and on-disk cached key so the next
+    _n8n_ensure_api_key call re-provisions instead of returning a value
+    already known to be invalid (e.g. after a 401, or after the key was
+    deleted from n8n's own UI).
+    """
+    _n8n_api_key_by_port.pop(int(port), None)
+    state_path = _n8n_owner_state_path(container_name)
+    if not os.path.isfile(state_path):
+        return
+    try:
+        with open(state_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return
+    if state.pop("apiKey", None) is not None:
+        _n8n_write_state(state_path, state)
+
+
 def _n8n_ensure_api_key(port, container_name):
     """Bootstrap a non-interactive owner account + Public API key for this
-    n8n instance, on first use, and cache/reuse it afterward for the life of
-    the process (re-fetched from n8n on next agent restart via the cached
-    owner credentials, not re-created).
+    n8n instance, on first use, and cache/reuse it afterward — in memory for
+    the life of the process, and on disk (alongside the owner login) so it
+    survives an agent restart without re-provisioning.
+
+    The on-disk cache isn't just an optimization: n8n only ever returns a
+    key's raw secret value in the response to the call that created it —
+    `GET /rest/api-keys` (listing) returns metadata only (label, scopes,
+    expiry), never the value. So once the in-memory cache is lost and there's
+    no on-disk copy, a previously-created key is unrecoverable by value, even
+    though n8n still shows it exists — the only way forward is to delete
+    that stale entry and create a new one, which is what happens below when
+    neither cache has a value.
 
     NOTE — verification spike: this targets the REST shape used by n8n's own
     setup wizard (`/rest/owner/setup`, `/rest/login`, `/rest/api-keys`) as of
@@ -1302,9 +1336,11 @@ def _n8n_ensure_api_key(port, container_name):
             "email": f"owner-{uuid.uuid4().hex[:12]}@local.invalid",
             "password": secrets.token_urlsafe(24) + "aA1",
         }
-        with open(state_path, "w", encoding="utf-8") as handle:
-            json.dump(state, handle)
-        os.chmod(state_path, 0o600)
+        _n8n_write_state(state_path, state)
+
+    if state.get("apiKey"):
+        _n8n_api_key_by_port[int(port)] = state["apiKey"]
+        return state["apiKey"]
 
     session = requests.Session()
 
@@ -1356,72 +1392,77 @@ def _n8n_ensure_api_key(port, container_name):
             "— cannot make authenticated API calls"
         )
 
-    api_key = None
+    # No on-disk value (first run on this instance, or it was invalidated
+    # after a 401/manual deletion) — n8n won't hand back the value of a
+    # pre-existing "private-ai-agent" key either, so clean up any such stale
+    # entry first. Leaving it in place would make the create call below
+    # 500 with "There is already an entry with this name."
     existing_keys = session.get(f"{base_url}/rest/api-keys", timeout=15)
     if existing_keys.ok:
         keys_data = (existing_keys.json() or {}).get("data")
-        # This n8n version's /rest/api-keys can return either a list of key
-        # objects or a single key object directly under "data" (e.g. when
-        # only one personal API key is supported per user) — handle both
-        # rather than assuming a list shape.
-        if isinstance(keys_data, list) and keys_data:
-            api_key = keys_data[0].get("apiKey") or keys_data[0].get("rawApiKey")
-        elif isinstance(keys_data, dict) and keys_data:
-            api_key = keys_data.get("apiKey") or keys_data.get("rawApiKey")
+        entries = keys_data if isinstance(keys_data, list) else (
+            [keys_data] if isinstance(keys_data, dict) and keys_data else []
+        )
+        for entry in entries:
+            if entry.get("label") == "private-ai-agent" and entry.get("id"):
+                session.delete(f"{base_url}/rest/api-keys/{entry['id']}", timeout=15)
     elif existing_keys.status_code != 401:
         print(
             f"n8n api-keys list returned {existing_keys.status_code}: "
             f"{existing_keys.text[:500]}"
         )
 
-    if not api_key:
-        # This n8n version requires an explicit `scopes` array (a "scoped
-        # API keys" feature) — its create-key modal offers an "All" preset
-        # that resolves to every scope the instance supports. Fetch that
-        # same list rather than hardcoding scope strings that could drift
-        # across n8n versions.
-        # NOTE: `/rest/api-keys/scopes` is a best guess at the endpoint the
-        # UI itself must call to populate its scope checkboxes — if this
-        # 404s, the error below will show the real response so the correct
-        # path/shape can be swapped in.
-        scopes_response = session.get(f"{base_url}/rest/api-keys/scopes", timeout=15)
-        if not scopes_response.ok:
-            raise RuntimeError(
-                f"n8n api-key scopes lookup failed ({scopes_response.status_code}): "
-                f"{scopes_response.text[:500]}"
-            )
-        scopes_body = scopes_response.json() or {}
-        all_scopes = scopes_body.get("data") if isinstance(scopes_body, dict) else scopes_body
-        if not isinstance(all_scopes, list) or not all_scopes:
-            raise RuntimeError(
-                f"Unexpected n8n api-key scopes response shape: {str(scopes_body)[:500]}"
-            )
-
-        # Unix seconds, matching the `exp` unit n8n's own issued JWT API
-        # keys use. 1 year out — long enough to avoid re-provisioning on
-        # every restart; if this instance enforces a shorter max, the error
-        # below will say so and the duration can be adjusted.
-        expires_at = int(time.time()) + 365 * 24 * 3600
-
-        created = session.post(
-            f"{base_url}/rest/api-keys",
-            json={"label": "private-ai-agent", "scopes": all_scopes, "expiresAt": expires_at},
-            timeout=15,
+    # This n8n version requires an explicit `scopes` array (a "scoped API
+    # keys" feature) — its create-key modal offers an "All" preset that
+    # resolves to every scope the instance supports. Fetch that same list
+    # rather than hardcoding scope strings that could drift across versions.
+    # NOTE: `/rest/api-keys/scopes` is a best guess at the endpoint the UI
+    # itself must call to populate its scope checkboxes — if this 404s, the
+    # error below will show the real response so the correct path/shape can
+    # be swapped in.
+    scopes_response = session.get(f"{base_url}/rest/api-keys/scopes", timeout=15)
+    if not scopes_response.ok:
+        raise RuntimeError(
+            f"n8n api-key scopes lookup failed ({scopes_response.status_code}): "
+            f"{scopes_response.text[:500]}"
         )
-        if not created.ok:
-            cookie_names = ",".join(session.cookies.keys()) or "none"
-            raise RuntimeError(
-                f"n8n api-key creation failed ({created.status_code}): "
-                f"{created.text[:500]} (session cookies present: {cookie_names})"
-            )
-        created_body = created.json() or {}
-        created_data = created_body.get("data")
-        if not isinstance(created_data, dict):
-            created_data = created_body if isinstance(created_body, dict) else {}
-        api_key = created_data.get("rawApiKey") or created_data.get("apiKey")
+    scopes_body = scopes_response.json() or {}
+    all_scopes = scopes_body.get("data") if isinstance(scopes_body, dict) else scopes_body
+    if not isinstance(all_scopes, list) or not all_scopes:
+        raise RuntimeError(
+            f"Unexpected n8n api-key scopes response shape: {str(scopes_body)[:500]}"
+        )
+
+    # Unix seconds, matching the `exp` unit n8n's own issued JWT API keys
+    # use. 1 year out — long enough to avoid re-provisioning on every
+    # restart now that the value itself is cached to disk below; if this
+    # instance enforces a shorter max, the error will say so.
+    expires_at = int(time.time()) + 365 * 24 * 3600
+
+    created = session.post(
+        f"{base_url}/rest/api-keys",
+        json={"label": "private-ai-agent", "scopes": all_scopes, "expiresAt": expires_at},
+        timeout=15,
+    )
+    if not created.ok:
+        cookie_names = ",".join(session.cookies.keys()) or "none"
+        raise RuntimeError(
+            f"n8n api-key creation failed ({created.status_code}): "
+            f"{created.text[:500]} (session cookies present: {cookie_names})"
+        )
+    created_body = created.json() or {}
+    created_data = created_body.get("data")
+    if not isinstance(created_data, dict):
+        created_data = created_body if isinstance(created_body, dict) else {}
+    api_key = created_data.get("rawApiKey") or created_data.get("apiKey")
 
     if not api_key:
         raise RuntimeError("Could not obtain an n8n Public API key")
+
+    # This is the only place the raw value is ever available — persist it
+    # now, since n8n will never hand it back via a list/get call again.
+    state["apiKey"] = api_key
+    _n8n_write_state(state_path, state)
 
     _n8n_api_key_by_port[int(port)] = api_key
     return api_key
@@ -1442,7 +1483,7 @@ def _n8n_authed_request(port, container_name, method, path, **kwargs):
         **kwargs,
     )
     if response.status_code == 401:
-        _n8n_api_key_by_port.pop(int(port), None)
+        _n8n_forget_api_key(port, container_name)
         api_key = _n8n_ensure_api_key(port, container_name)
         response = requests.request(
             method,
