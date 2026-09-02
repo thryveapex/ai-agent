@@ -186,6 +186,51 @@ def get_storage_stats():
     return storage
 
 
+def get_unused_disks():
+    """Whole disks with no mounted filesystem anywhere on them — invisible
+    to get_storage_stats() above, which only sees already-mounted
+    partitions via psutil. Detect-and-display only (Milestone 3 scope):
+    this reports capacity that exists but isn't usable yet, it doesn't
+    format/mount/allocate anything.
+    """
+    try:
+        result = subprocess.run(
+            ["lsblk", "-J", "-b", "-o", "NAME,SIZE,TYPE,MOUNTPOINT"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as error:
+        print(f"get_unused_disks error: {error}")
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return []
+
+    def has_any_mountpoint(node):
+        if node.get("mountpoint"):
+            return True
+        return any(has_any_mountpoint(child) for child in (node.get("children") or []))
+
+    unused = []
+    for device in data.get("blockdevices", []):
+        if device.get("type") != "disk":
+            continue
+        if has_any_mountpoint(device):
+            continue
+        size = device.get("size")
+        unused.append({
+            "name": device.get("name"),
+            "size": int(size) if size is not None else None,
+        })
+    return unused
+
+
 def get_lan_ip():
     try:
         result = subprocess.run(
@@ -270,6 +315,7 @@ def send_heartbeat():
         "memory": telemetry["memory"],
         "storage": telemetry["storage"],
         "container_states": get_container_states(),
+        "unused_disks": get_unused_disks(),
     }
     if lan_ip:
         body["lan_ip"] = lan_ip
