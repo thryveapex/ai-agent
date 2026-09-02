@@ -225,6 +225,41 @@ def collect_telemetry():
     }
 
 
+def get_container_states():
+    """Reports the actual docker state of every container this agent might
+    have created (vllm-*/n8n-* by naming convention), so the control plane
+    can reconcile its stored status against reality — e.g. it thinks an
+    instance is ONLINE but the container has actually exited, or it marked
+    an instance AGENT_DISCONNECTED and the container turns out to still be
+    running fine. Matched by container name, not instance ID, since that's
+    all `docker ps` can give us without a control-plane round trip.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as error:
+        print(f"get_container_states error: {error}")
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    states = []
+    for line in (result.stdout or "").strip().splitlines():
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        name, state, status_text = parts
+        if not (name.startswith("vllm-") or name.startswith("n8n-")):
+            continue
+        states.append({"name": name, "state": state, "status": status_text})
+    return states
+
+
 def send_heartbeat():
     telemetry = collect_telemetry()
     lan_ip = get_lan_ip()
@@ -234,6 +269,7 @@ def send_heartbeat():
         "cpu": telemetry["cpu"],
         "memory": telemetry["memory"],
         "storage": telemetry["storage"],
+        "container_states": get_container_states(),
     }
     if lan_ip:
         body["lan_ip"] = lan_ip
@@ -1062,6 +1098,9 @@ def smoke_test_inference(port, model_id):
         )
 
 
+STALL_THRESHOLD_SECONDS = 90
+
+
 def wait_for_model_health(command_id, port, container_name, timeout_seconds=300):
     started = time.time()
     report_progress(
@@ -1073,6 +1112,7 @@ def wait_for_model_health(command_id, port, container_name, timeout_seconds=300)
     deadline = time.time() + timeout_seconds
     last_error = None
     last_health_report = 0.0
+    last_error_changed_at = started
     served_model_id = None
     while time.time() < deadline:
         try:
@@ -1103,11 +1143,15 @@ def wait_for_model_health(command_id, port, container_name, timeout_seconds=300)
                     log_line="health check + smoke test ok"
                 )
                 return served_model_id
-            last_error = f"HTTP {response.status_code}"
+            new_error = f"HTTP {response.status_code}"
         except InstallError:
             raise
         except Exception as error:
-            last_error = str(error)
+            new_error = str(error)
+
+        if new_error != last_error:
+            last_error = new_error
+            last_error_changed_at = time.time()
 
         # The container may have crashed rather than "still starting" — don't
         # wait out the whole timeout to discover that.
@@ -1124,10 +1168,18 @@ def wait_for_model_health(command_id, port, container_name, timeout_seconds=300)
         now = time.time()
         if now - last_health_report >= 10:
             elapsed = int(now - started)
+            stalled_for = now - last_error_changed_at
+            if stalled_for >= STALL_THRESHOLD_SECONDS:
+                message = (
+                    f"Still waiting for the model server ({elapsed}s) — no change in "
+                    f"{int(stalled_for)}s, this may be stuck rather than just slow"
+                )
+            else:
+                message = f"Waiting for model server to become ready… ({elapsed}s)"
             progress_response = report_progress(
                 command_id,
                 "HEALTH_CHECKING",
-                f"Waiting for model server to become ready… ({elapsed}s)",
+                message,
                 percent=90,
                 log_line=f"health poll: {last_error or 'starting'}"
             )
