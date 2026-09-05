@@ -27,6 +27,11 @@ HF_CACHE_HOST = os.environ.get("HF_CACHE_DIR", "/opt/ai-node/hf-cache")
 N8N_CONTAINER_PORT = 5678
 N8N_STATE_DIR = os.environ.get("N8N_AGENT_STATE_DIR", "/opt/ai-node/n8n-state")
 
+# Hermes Agent app type — two containers per instance (gateway + web UI),
+# unlike n8n's single container. LAN-direct dashboard access only this pass.
+HERMES_GATEWAY_CONTAINER_PORT = 8642
+HERMES_UI_CONTAINER_PORT = 3000
+
 
 def load_credentials(path: str = CREDENTIALS_PATH) -> dict:
     if not os.path.isfile(path):
@@ -272,7 +277,7 @@ def collect_telemetry():
 
 def get_container_states():
     """Reports the actual docker state of every container this agent might
-    have created (vllm-*/n8n-* by naming convention), so the control plane
+    have created (vllm-*/n8n-*/hermes-* by naming convention), so the control plane
     can reconcile its stored status against reality — e.g. it thinks an
     instance is ONLINE but the container has actually exited, or it marked
     an instance AGENT_DISCONNECTED and the container turns out to still be
@@ -299,7 +304,7 @@ def get_container_states():
         if len(parts) != 3:
             continue
         name, state, status_text = parts
-        if not (name.startswith("vllm-") or name.startswith("n8n-")):
+        if not (name.startswith("vllm-") or name.startswith("n8n-") or name.startswith("hermes-")):
             continue
         states.append({"name": name, "state": state, "status": status_text})
     return states
@@ -1337,10 +1342,10 @@ def handle_onload_llm(command_id, payload):
 
 
 def app_docker_run_args(container_name, container_image, port, data_volume_name):
-    """Generic app container: no CLI flags appended, unlike vLLM's run args —
-    the image runs as-is. Only n8n uses this today, hence the fixed internal
-    port; if a second app type is added, make N8N_CONTAINER_PORT a payload
-    field instead of a module constant.
+    """Generic single-container app: no CLI flags appended, unlike vLLM's run
+    args — the image runs as-is. n8n only, hence the fixed internal port.
+    Hermes (two containers per instance) uses hermes_docker_run_args instead
+    — this function and its n8n call sites are untouched by that addition.
     """
     return [
         "docker", "run", "-d",
@@ -1356,6 +1361,93 @@ def app_docker_run_args(container_name, container_image, port, data_volume_name)
         "-e", "N8N_SECURE_COOKIE=false",
         container_image,
     ]
+
+
+def hermes_docker_run_args(container_name, container_image, host_port, container_port, volume_mounts, env_vars, network_name):
+    """One of Hermes's two containers (gateway or UI). Unlike n8n's single
+    fixed volume/env, each Hermes container needs its own list of (volume,
+    container_path) mounts and its own env dict, and both share a per-instance
+    Docker network so they can reach each other by container-name DNS.
+    """
+    args = [
+        "docker", "run", "-d",
+        "--name", container_name,
+        "--restart", "unless-stopped",
+        "--network", network_name,
+    ]
+    if host_port is not None:
+        args += ["-p", f"{host_port}:{container_port}"]
+    for volume_name, container_path in (volume_mounts or []):
+        args += ["-v", f"{volume_name}:{container_path}"]
+    for key, value in (env_vars or {}).items():
+        args += ["-e", f"{key}={value}"]
+    args.append(container_image)
+    return args
+
+
+def docker_network_create(network_name):
+    result = subprocess.run(
+        ["docker", "network", "create", network_name],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "already exists" not in stderr:
+            raise RuntimeError(f"docker network create failed: {(result.stderr or result.stdout).strip()}")
+
+
+def docker_network_rm(network_name):
+    """Best-effort — called during cleanup, never allowed to mask the real error."""
+    try:
+        subprocess.run(["docker", "network", "rm", network_name], capture_output=True, text=True, timeout=15)
+    except Exception as error:
+        print(f"docker network rm {network_name} error (ignored): {error}")
+
+
+def wait_for_ports_health(command_id, ports, timeout_seconds=180, label="app"):
+    """Multi-port version of wait_for_app_health — waits until every
+    (name, port) pair responds, used by Hermes (gateway + UI). n8n keeps
+    using the original single-port wait_for_app_health, untouched below.
+    """
+    started = time.time()
+    report_progress(command_id, "health_check", f"Waiting for {label} to become ready…", percent=90)
+    deadline = time.time() + timeout_seconds
+    pending = dict(ports)
+    last_errors = {}
+    last_health_report = 0.0
+    while time.time() < deadline and pending:
+        for name, port in list(pending.items()):
+            try:
+                response = requests.get(f"http://127.0.0.1:{port}/", timeout=5)
+                if response.status_code < 400:
+                    del pending[name]
+                    continue
+                last_errors[name] = f"HTTP {response.status_code}"
+            except Exception as error:
+                last_errors[name] = str(error)
+
+        if not pending:
+            break
+
+        now = time.time()
+        if now - last_health_report >= 10:
+            elapsed = int(now - started)
+            waiting_on = ", ".join(pending.keys())
+            report_progress(
+                command_id,
+                "health_check",
+                f"Waiting for {label} to become ready… ({elapsed}s, still waiting on: {waiting_on})",
+                percent=90,
+                log_line=f"health poll: {last_errors}"
+            )
+            last_health_report = now
+        time.sleep(5)
+
+    if pending:
+        raise TimeoutError(f"{label} did not become healthy: {last_errors}")
+
+    report_progress(command_id, "health_check", f"{label} is healthy", percent=95, log_line="health check ok")
 
 
 def wait_for_app_health(command_id, port, timeout_seconds=180):
@@ -1405,6 +1497,10 @@ _container_name_by_port = {}
 
 
 def handle_install_app(command_id, payload):
+    if payload.get("appType") == "hermes":
+        _handle_install_hermes(command_id, payload)
+        return
+
     container_name = payload.get("containerName")
     container_image = payload.get("containerImage")
     port = payload.get("port")
@@ -1457,7 +1553,117 @@ def handle_install_app(command_id, payload):
     )
 
 
+def _hermes_cleanup(container_names, network_name):
+    """Best-effort teardown on a failed Hermes install — never allowed to
+    mask the real error that triggered it.
+    """
+    for name in (container_names or {}).values():
+        try:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=30)
+        except Exception as error:
+            print(f"hermes cleanup: docker rm -f {name} error (ignored): {error}")
+    if network_name:
+        docker_network_rm(network_name)
+
+
+def _handle_install_hermes(command_id, payload):
+    container_images = payload.get("containerImages") or {}
+    container_names = payload.get("containerNames") or {}
+    ports = payload.get("ports") or {}
+    data_volume_names = payload.get("dataVolumeNames") or {}
+    network_name = payload.get("networkName")
+    gateway_env = payload.get("gatewayEnv") or {}
+    ui_env = payload.get("uiEnv") or {}
+
+    required = [
+        container_images.get("gateway"), container_images.get("ui"),
+        container_names.get("gateway"), container_names.get("ui"),
+        ports.get("gateway"), ports.get("ui"),
+        data_volume_names.get("agentData"), data_volume_names.get("workspaceFiles"),
+        network_name,
+    ]
+    if not all(required):
+        raise ValueError("INSTALL_APP (hermes) payload missing required fields")
+
+    report_progress(command_id, "validate", "Checking Docker", percent=5)
+    docker_available()
+
+    try:
+        report_progress(command_id, "network", f"Creating network {network_name}", percent=10, log_line=f"docker network create {network_name}")
+        docker_network_create(network_name)
+
+        report_progress(
+            command_id, "pull_image", f"Pulling {container_images['gateway']}",
+            percent=20, log_line=f"docker pull {container_images['gateway']}"
+        )
+        docker_pull_with_progress(command_id, container_images["gateway"], timeout=1200)
+
+        report_progress(
+            command_id, "pull_image", f"Pulling {container_images['ui']}",
+            percent=45, log_line=f"docker pull {container_images['ui']}"
+        )
+        docker_pull_with_progress(command_id, container_images["ui"], timeout=1200)
+
+        for name in container_names.values():
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+
+        report_progress(
+            command_id, "start_container", f"Starting {container_names['gateway']}",
+            percent=65, log_line=f"docker run {container_names['gateway']}"
+        )
+        run_subprocess(
+            hermes_docker_run_args(
+                container_names["gateway"], container_images["gateway"],
+                ports["gateway"], HERMES_GATEWAY_CONTAINER_PORT,
+                [(data_volume_names["agentData"], "/opt/data")],
+                gateway_env, network_name,
+            ),
+            timeout=120,
+        )
+
+        report_progress(
+            command_id, "start_container", f"Starting {container_names['ui']}",
+            percent=75, log_line=f"docker run {container_names['ui']}"
+        )
+        run_subprocess(
+            hermes_docker_run_args(
+                container_names["ui"], container_images["ui"],
+                ports["ui"], HERMES_UI_CONTAINER_PORT,
+                [
+                    (data_volume_names["agentData"], "/home/workspace/.hermes"),
+                    (data_volume_names["workspaceFiles"], "/workspace"),
+                ],
+                ui_env, network_name,
+            ),
+            timeout=120,
+        )
+
+        wait_for_ports_health(
+            command_id,
+            {"gateway": ports["gateway"], "ui": ports["ui"]},
+            timeout_seconds=180,
+            label="Hermes",
+        )
+    except Exception:
+        _hermes_cleanup(container_names, network_name)
+        raise
+
+    complete_command(
+        command_id,
+        "COMPLETED",
+        {
+            "ports": ports,
+            "container_names": container_names,
+            "data_volume_names": data_volume_names,
+        }
+    )
+
+
 def handle_offload_app(command_id, payload):
+    if payload.get("appType") == "hermes":
+        _handle_offload_hermes(command_id, payload)
+        return
+
     container_name = payload.get("containerName")
     if not container_name:
         raise ValueError("OFFLOAD_APP payload missing containerName")
@@ -1488,7 +1694,33 @@ def handle_offload_app(command_id, payload):
     )
 
 
+def _handle_offload_hermes(command_id, payload):
+    container_names = payload.get("containerNames") or {}
+    if not container_names:
+        raise ValueError("OFFLOAD_APP (hermes) payload missing containerNames")
+
+    for role, name in container_names.items():
+        report_progress(
+            command_id, "stop_container", f"Stopping {name}",
+            percent=50, log_line=f"docker stop {name}"
+        )
+        result = subprocess.run(["docker", "stop", name], capture_output=True, text=True)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").lower()
+            if "no such container" not in stderr and "is not running" not in stderr:
+                raise RuntimeError(f"docker stop failed ({role}): {(result.stderr or result.stdout).strip()}")
+
+    complete_command(
+        command_id, "COMPLETED",
+        {"container_names": container_names, "action": "offloaded"}
+    )
+
+
 def handle_onload_app(command_id, payload):
+    if payload.get("appType") == "hermes":
+        _handle_onload_hermes(command_id, payload)
+        return
+
     container_name = payload.get("containerName")
     port = payload.get("port")
     if not container_name or port is None:
@@ -1542,7 +1774,126 @@ def handle_onload_app(command_id, payload):
     )
 
 
+def _handle_onload_hermes(command_id, payload):
+    container_names = payload.get("containerNames") or {}
+    ports = payload.get("ports") or {}
+    if not container_names or not ports:
+        raise ValueError("ONLOAD_APP (hermes) payload missing containerNames or ports")
+
+    container_images = payload.get("containerImages") or {}
+    data_volume_names = payload.get("dataVolumeNames") or {}
+    network_name = payload.get("networkName")
+    gateway_env = payload.get("gatewayEnv") or {}
+    ui_env = payload.get("uiEnv") or {}
+
+    volume_mounts_by_role = {
+        "gateway": [(data_volume_names.get("agentData"), "/opt/data")],
+        "ui": [
+            (data_volume_names.get("agentData"), "/home/workspace/.hermes"),
+            (data_volume_names.get("workspaceFiles"), "/workspace"),
+        ],
+    }
+    container_ports_by_role = {"gateway": HERMES_GATEWAY_CONTAINER_PORT, "ui": HERMES_UI_CONTAINER_PORT}
+    env_by_role = {"gateway": gateway_env, "ui": ui_env}
+
+    for role, name in container_names.items():
+        report_progress(
+            command_id, "start_container", f"Starting {name}",
+            percent=40, log_line=f"docker start {name}"
+        )
+        result = subprocess.run(["docker", "start", name], capture_output=True, text=True)
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").lower()
+            if "no such container" in stderr:
+                report_progress(
+                    command_id, "start_container", f"{name} missing; recreating with docker run",
+                    percent=50, log_line="fallback docker run"
+                )
+                run_subprocess(
+                    hermes_docker_run_args(
+                        name, container_images.get(role), ports.get(role),
+                        container_ports_by_role[role], volume_mounts_by_role[role],
+                        env_by_role[role], network_name,
+                    ),
+                    timeout=120,
+                )
+            else:
+                raise RuntimeError(f"docker start failed ({role}): {(result.stderr or result.stdout).strip()}")
+
+    wait_for_ports_health(command_id, ports, timeout_seconds=180, label="Hermes")
+
+    complete_command(
+        command_id, "COMPLETED",
+        {"ports": ports, "container_names": container_names, "action": "onloaded"}
+    )
+
+
+def _handle_delete_hermes(command_id, payload):
+    container_names = payload.get("containerNames") or {}
+    data_volume_names = payload.get("dataVolumeNames") or {}
+    network_name = payload.get("networkName")
+    if not container_names:
+        raise ValueError("DELETE_APP (hermes) payload missing containerNames")
+
+    for role, name in container_names.items():
+        report_progress(
+            command_id, "stop_container", f"Stopping {name}",
+            percent=20, log_line=f"docker stop {name}"
+        )
+        subprocess.run(["docker", "stop", name], capture_output=True, text=True)
+
+        report_progress(
+            command_id, "remove_container", f"Removing {name}",
+            percent=40, log_line=f"docker rm -fv {name}"
+        )
+        result = subprocess.run(["docker", "rm", "-fv", name], capture_output=True, text=True)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").lower()
+            if "no such container" not in stderr:
+                raise RuntimeError(f"docker rm failed ({role}): {(result.stderr or result.stdout).strip()}")
+
+    # Same irreversible-data-loss note as n8n's delete: gated by confirm=true
+    # at the API layer, not something to second-guess here.
+    volumes_removed = {}
+    for volume_role, volume_name in data_volume_names.items():
+        if not volume_name:
+            continue
+        report_progress(
+            command_id, "remove_volume", f"Removing volume {volume_name}",
+            percent=70, log_line=f"docker volume rm {volume_name}"
+        )
+        vol_result = subprocess.run(["docker", "volume", "rm", volume_name], capture_output=True, text=True)
+        if vol_result.returncode == 0:
+            volumes_removed[volume_role] = True
+        else:
+            stderr = (vol_result.stderr or "").lower()
+            if "no such volume" not in stderr:
+                raise RuntimeError(f"docker volume rm failed ({volume_role}): {(vol_result.stderr or vol_result.stdout).strip()}")
+            volumes_removed[volume_role] = False
+
+    if network_name:
+        report_progress(
+            command_id, "remove_network", f"Removing network {network_name}",
+            percent=90, log_line=f"docker network rm {network_name}"
+        )
+        docker_network_rm(network_name)
+
+    complete_command(
+        command_id, "COMPLETED",
+        {
+            "container_names": container_names,
+            "data_volume_names": data_volume_names,
+            "volumes_removed": volumes_removed,
+            "action": "deleted",
+        }
+    )
+
+
 def handle_delete_app(command_id, payload):
+    if payload.get("appType") == "hermes":
+        _handle_delete_hermes(command_id, payload)
+        return
+
     container_name = payload.get("containerName")
     data_volume_name = payload.get("dataVolumeName")
     if not container_name:
