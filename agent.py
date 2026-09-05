@@ -1427,11 +1427,14 @@ def wait_for_ports_health(command_id, ports, timeout_seconds=180, label="app"):
     while time.time() < deadline and pending:
         for name, port in list(pending.items()):
             try:
-                response = requests.get(f"http://127.0.0.1:{port}/", timeout=5)
-                if response.status_code < 400:
-                    del pending[name]
-                    continue
-                last_errors[name] = f"HTTP {response.status_code}"
+                # Any real HTTP response — even a 404 — proves the port is
+                # alive and speaking HTTP, which is all this checks. Unlike
+                # n8n/vLLM's root path, Hermes's gateway has nothing mapped
+                # at bare "/" (its real endpoints are under /v1/...), so a
+                # 404 there is a healthy API server, not a broken one.
+                requests.get(f"http://127.0.0.1:{port}/", timeout=5)
+                del pending[name]
+                continue
             except Exception as error:
                 last_errors[name] = str(error)
 
