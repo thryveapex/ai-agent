@@ -1363,11 +1363,17 @@ def app_docker_run_args(container_name, container_image, port, data_volume_name)
     ]
 
 
-def hermes_docker_run_args(container_name, container_image, host_port, container_port, volume_mounts, env_vars, network_name):
+def hermes_docker_run_args(container_name, container_image, host_port, container_port, volume_mounts, env_vars, network_name, command=None):
     """One of Hermes's two containers (gateway or UI). Unlike n8n's single
     fixed volume/env, each Hermes container needs its own list of (volume,
     container_path) mounts and its own env dict, and both share a per-instance
     Docker network so they can reach each other by container-name DNS.
+
+    `command`: the gateway container's image defaults to launching Hermes's
+    interactive CLI, which immediately exits when run detached (no TTY/stdin)
+    — it must be started with ["gateway", "run"] instead to actually run the
+    API server. The UI container needs no override (its default command is
+    already the right one), hence this being optional.
     """
     args = [
         "docker", "run", "-d",
@@ -1382,6 +1388,8 @@ def hermes_docker_run_args(container_name, container_image, host_port, container
     for key, value in (env_vars or {}).items():
         args += ["-e", f"{key}={value}"]
     args.append(container_image)
+    if command:
+        args += list(command)
     return args
 
 
@@ -1617,6 +1625,7 @@ def _handle_install_hermes(command_id, payload):
                 ports["gateway"], HERMES_GATEWAY_CONTAINER_PORT,
                 [(data_volume_names["agentData"], "/opt/data")],
                 gateway_env, network_name,
+                command=["gateway", "run"],
             ),
             timeout=120,
         )
@@ -1795,6 +1804,7 @@ def _handle_onload_hermes(command_id, payload):
     }
     container_ports_by_role = {"gateway": HERMES_GATEWAY_CONTAINER_PORT, "ui": HERMES_UI_CONTAINER_PORT}
     env_by_role = {"gateway": gateway_env, "ui": ui_env}
+    command_by_role = {"gateway": ["gateway", "run"], "ui": None}
 
     for role, name in container_names.items():
         report_progress(
@@ -1814,6 +1824,7 @@ def _handle_onload_hermes(command_id, payload):
                         name, container_images.get(role), ports.get(role),
                         container_ports_by_role[role], volume_mounts_by_role[role],
                         env_by_role[role], network_name,
+                        command=command_by_role[role],
                     ),
                     timeout=120,
                 )
